@@ -126,10 +126,10 @@ export const LEVELS = [
         { type: 'orbiter', fx: 0.22, fy: 0.5, pattern: 'single', orbit: 0.26 },
       ],
       [
-        { type: 'charger', fx: 0.5, fy: 0.1 },
-        { type: 'charger', fx: 0.5, fy: 0.9 },
-        { type: 'turret', fx: 0.12, fy: 0.5, pattern: 'burst' },
-        { type: 'turret', fx: 0.88, fy: 0.5, pattern: 'burst' },
+        { type: 'charger', fx: 0.3, fy: 0.09 },
+        { type: 'charger', fx: 0.7, fy: 0.91 },
+        { type: 'turret', fx: 0.12, fy: 0.3, pattern: 'burst' },
+        { type: 'turret', fx: 0.88, fy: 0.7, pattern: 'burst' },
       ],
     ],
   },
@@ -150,9 +150,9 @@ export const LEVELS = [
       { fx: 0.6, fy: 0.485, fw: 0.1, fh: 0.03, type: 'destructible' },
     ],
     cores: [
-      { fx: 0.5, fy: 0.28, hp: 8, pattern: 'rotating' },
-      { fx: 0.28, fy: 0.72, hp: 8, pattern: 'rotating' },
-      { fx: 0.72, fy: 0.72, hp: 8, pattern: 'rotating' },
+      { fx: 0.5, fy: 0.17, hp: 8, pattern: 'rotating' },
+      { fx: 0.18, fy: 0.62, hp: 8, pattern: 'rotating' },
+      { fx: 0.82, fy: 0.62, hp: 8, pattern: 'rotating' },
     ],
     waves: [
       [

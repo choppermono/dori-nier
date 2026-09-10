@@ -51,6 +51,26 @@ function pushOut(obj, r, rect) {
   else obj.y = rect.y + rect.h + r
 }
 
+// Ein Gegner in einem Block ist unverwundbar: eigene Schuesse werden vom Block
+// verschluckt, bevor sie ihn erreichen. Deshalb wird beim Erscheinen herausgeschoben,
+// egal was die Leveldaten sagen. Die Daten sind zusaetzlich geprueft, aber diese
+// Absicherung haelt auch, wenn spaeter jemand ein Level danebensetzt.
+function nudgeOutOfBlocks(blocks, obj, r) {
+  // Etwas mehr als der Radius, damit der Gegner nicht exakt an der Kante klebt.
+  // Genau anliegend zaehlt je nach Rundung noch als Ueberschneidung.
+  const clear = r + 2
+  for (let pass = 0; pass < 4; pass++) {
+    let moved = false
+    for (const b of blocks) {
+      if (!b.alive) continue
+      const before = `${obj.x},${obj.y}`
+      pushOut(obj, clear, b)
+      if (`${obj.x},${obj.y}` !== before) moved = true
+    }
+    if (!moved) break
+  }
+}
+
 function normalizeAngle(a) {
   while (a > Math.PI) a -= Math.PI * 2
   while (a < -Math.PI) a += Math.PI * 2
@@ -211,10 +231,14 @@ function startWave(game, index) {
     return
   }
   for (const spec of wave) {
+    // Markierung schon an der bereinigten Stelle zeigen, damit sie nicht woanders
+    // steht als der Gegner, der gleich erscheint.
+    const spot = { x: spec.x, y: spec.y }
+    nudgeOutOfBlocks(game.blocks, spot, spec.radius)
     game.pendingSpawns.push({
       spec,
-      x: spec.x,
-      y: spec.y,
+      x: spot.x,
+      y: spot.y,
       radius: spec.radius,
       timer: TUNING.wave.spawnWarnSeconds,
     })
@@ -572,7 +596,13 @@ function updateWaves(game, dt) {
     const sp = game.pendingSpawns[i]
     sp.timer -= dt
     if (sp.timer <= 0) {
-      game.enemies.push(spawnEnemy(sp.spec))
+      const e = spawnEnemy(sp.spec)
+      // An der Markierung erscheinen, nicht an der rohen Leveldefinition - und
+      // nochmal pruefen, falls sich seit der Vorwarnung etwas geaendert hat.
+      e.x = sp.x
+      e.y = sp.y
+      nudgeOutOfBlocks(game.blocks, e, e.radius)
+      game.enemies.push(e)
       game.pendingSpawns.splice(i, 1)
     }
   }
