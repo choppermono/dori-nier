@@ -1,9 +1,16 @@
 <script setup>
-import TheWelcome from '../components/TheWelcome.vue'
+import GameCanvas from '@/components/GameCanvas.vue'
 </script>
 
 <template>
-  <main>
-    <TheWelcome />
+  <main class="page">
+    <GameCanvas />
   </main>
 </template>
+
+<style scoped>
+.page {
+  width: 100%;
+  height: 100%;
+}
+</style>
