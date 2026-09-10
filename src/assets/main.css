@@ -1,5 +1,44 @@
-/* Kein Vue-Starter-Theme mehr. Das Spiel fuellt den Bildschirm, deshalb haengen
-   html, body und #app alle auf voller Hoehe. */
+/* ==========================================================================
+   Dori — globale Tokens und Reset
+   Palette und Schriften uebernommen aus PersonalSite/src/style.css, damit
+   Startseite und Spiel wie dasselbe Produkt aussehen.
+   ========================================================================== */
+
+:root {
+  /* --- Flaechen: warmes Anthrazit, nie reines Schwarz --- */
+  --void: #100f0d;
+  --ash: #16150f;
+  --panel: #1c1b14;
+  --panel-solid: #221f18;
+
+  /* --- Tinte: das NieR-Pergament --- */
+  --bone: #dcd8c0; /* 13.3:1 auf --void */
+  --bone-dim: #a9a48a; /*  7.6:1 */
+  --bone-mute: #8f8a73; /*  5.5:1 — dunkelster Ton, der noch Text tragen darf */
+
+  /* --- Linien --- */
+  --line: rgba(220, 216, 192, 0.2);
+  --line-strong: rgba(220, 216, 192, 0.42);
+
+  /* --- Signalrot --- */
+  --sig-text: #e0574f;
+  --sig-fill: #bc3f3c;
+
+  /* --- Bedrohungen bleiben laut. Die ruhige Palette gilt fuer Rahmen und
+         Menue, nicht fuer Dinge, die einen toeten. --- */
+  --bullet-orange: #e8a33d;
+  --bullet-purple: #b47fdd;
+
+  /* --- Schrift --- */
+  --display: 'Cormorant Garamond', 'Iowan Old Style', Georgia, serif;
+  --body: 'Barlow', system-ui, 'Segoe UI', sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  color-scheme: dark;
+  font-size: 16px;
+}
 
 *,
 *::before,
@@ -15,9 +54,9 @@ body,
 
 body {
   margin: 0;
-  background: #100f0d;
-  color: #dcd8c0;
-  font-family: 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  background: var(--void);
+  color: var(--bone);
+  font-family: var(--body);
   -webkit-font-smoothing: antialiased;
   /* Ueberscrollen auf dem Handy abschalten, sonst zieht der Daumen die Seite mit. */
   overscroll-behavior: none;
@@ -25,4 +64,8 @@ body {
 
 #app {
   overflow: hidden;
+}
+
+button {
+  font-family: var(--body);
 }

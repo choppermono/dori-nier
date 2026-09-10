@@ -1,8 +1,10 @@
 <script setup>
-import { onMounted, onBeforeUnmount, ref, shallowRef } from 'vue'
-import { createGame, update, resize, isShielded, remainingTargets } from '@/game/engine.js'
+import { onMounted, onBeforeUnmount, ref, shallowRef, computed } from 'vue'
+import { createGame, update, resize, isShielded, enemiesLeft, waveLabel } from '@/game/engine.js'
 import { render } from '@/game/render.js'
 import { createInput } from '@/game/input.js'
+import { LEVELS, LEVEL_COUNT } from '@/game/levels.js'
+import { loadProgress, rememberReached, rememberCleared } from '@/game/progress.js'
 
 // Die Grenze zwischen Vue und Spiel: Vue verwaltet Menue und Anzeige, alles innerhalb
 // des Canvas laeuft ueber requestAnimationFrame und ruehrt die Reaktivitaet nicht an.
@@ -11,12 +13,18 @@ import { createInput } from '@/game/input.js'
 const canvasEl = ref(null)
 const game = shallowRef(null)
 
-const status = ref('ready')
-const hp = ref(0)
-const maxHp = ref(0)
+const screen = ref('menu') // menu | playing | levelclear | complete | lost
+const highest = ref(0)
+const cleared = ref([])
+const levelIndex = ref(0)
+
+const levelName = ref('')
+const levelSub = ref('')
 const timeLeft = ref(0)
-const targetsLeft = ref(0)
+const wave = ref('')
+const foes = ref(0)
 const shielded = ref(true)
+const lossReason = ref('')
 
 let ctx = null
 let input = null
@@ -24,39 +32,69 @@ let frameId = null
 let lastTime = 0
 let observer = null
 
+// Nach einer Niederlage geht es ein Level zurueck - aber das hoechste je erreichte
+// Level bleibt gespeichert. Der Rueckwurf gilt fuer den Durchgang, nicht fuer den
+// Fortschritt.
+const fallbackLevel = computed(() => Math.max(0, levelIndex.value - 1))
+
+const levelList = computed(() =>
+  LEVELS.map((l, i) => ({
+    index: i,
+    name: l.name,
+    subtitle: l.subtitle,
+    waves: l.waves.length,
+    unlocked: i <= highest.value,
+    done: cleared.value.includes(i),
+  })),
+)
+
+function refreshProgress() {
+  const p = loadProgress()
+  highest.value = p.highest
+  cleared.value = p.cleared
+}
+
 function syncHud() {
   const g = game.value
   if (!g) return
-  status.value = g.status
-  hp.value = g.player.hp
-  maxHp.value = g.player.maxHp
   timeLeft.value = Math.ceil(g.timeLeft)
-  targetsLeft.value = remainingTargets(g)
+  wave.value = waveLabel(g)
+  foes.value = enemiesLeft(g)
   shielded.value = isShielded(g)
+
+  if (g.status === 'levelclear' && screen.value === 'playing') {
+    rememberCleared(g.levelIndex)
+    refreshProgress()
+    screen.value = g.levelIndex >= LEVEL_COUNT - 1 ? 'complete' : 'levelclear'
+  } else if (g.status === 'lost' && screen.value === 'playing') {
+    lossReason.value = g.lossReason
+    screen.value = 'lost'
+  }
+}
+
+function canvasSize() {
+  const rect = canvasEl.value.getBoundingClientRect()
+  return {
+    w: Math.max(2, Math.round(rect.width)),
+    h: Math.max(2, Math.round(rect.height)),
+  }
 }
 
 function fitCanvas() {
   const canvas = canvasEl.value
   if (!canvas) return
-
-  const rect = canvas.getBoundingClientRect()
-  const cssW = Math.max(2, Math.round(rect.width))
-  const cssH = Math.max(2, Math.round(rect.height))
+  const { w, h } = canvasSize()
 
   // Auf Bildschirmen mit hoher Pixeldichte wird der Puffer groesser gezeichnet und
   // anschliessend heruntergerechnet, sonst sehen die duennen Linien matschig aus.
   const dpr = Math.min(window.devicePixelRatio || 1, 2)
-  canvas.width = Math.round(cssW * dpr)
-  canvas.height = Math.round(cssH * dpr)
-
+  canvas.width = Math.round(w * dpr)
+  canvas.height = Math.round(h * dpr)
   ctx = canvas.getContext('2d')
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
 
-  if (!game.value) {
-    game.value = createGame(cssW, cssH)
-  } else {
-    resize(game.value, cssW, cssH)
-  }
+  if (!game.value) game.value = createGame(0, w, h)
+  else resize(game.value, w, h)
   syncHud()
 }
 
@@ -70,23 +108,30 @@ function loop(now) {
   const dt = Math.min(0.05, (now - lastTime) / 1000 || 0)
   lastTime = now
 
-  if (g.status === 'running') {
-    update(g, dt, input.read())
-  }
-
+  if (g.status === 'running') update(g, dt, input.read())
   render(ctx, g, input.sticks)
   syncHud()
 }
 
-function startRound() {
-  const canvas = canvasEl.value
-  if (!canvas) return
-  const rect = canvas.getBoundingClientRect()
-  game.value = createGame(Math.max(2, Math.round(rect.width)), Math.max(2, Math.round(rect.height)))
-  game.value.status = 'running'
+function startLevel(i) {
+  const { w, h } = canvasSize()
+  const g = createGame(i, w, h)
+  g.status = 'running'
+  game.value = g
+  levelIndex.value = i
+  levelName.value = g.levelName
+  levelSub.value = g.levelSubtitle
+  rememberReached(i)
+  refreshProgress()
   input.reset()
   lastTime = performance.now()
+  screen.value = 'playing'
   syncHud()
+}
+
+function toMenu() {
+  refreshProgress()
+  screen.value = 'menu'
 }
 
 onMounted(() => {
@@ -96,6 +141,7 @@ onMounted(() => {
     y: game.value ? game.value.player.y : 0,
   }))
 
+  refreshProgress()
   fitCanvas()
 
   observer = new ResizeObserver(() => fitCanvas())
@@ -116,55 +162,107 @@ onBeforeUnmount(() => {
   <div class="stage">
     <canvas ref="canvasEl" class="surface"></canvas>
 
-    <div v-if="status === 'running'" class="hud">
-      <div class="hud-left">
-        <span class="label">Integrität</span>
-        <span class="pips">
-          <i v-for="n in maxHp" :key="n" :class="{ lost: n > hp }"></i>
-        </span>
-      </div>
-      <div class="hud-right">
-        <span class="label">Zeit</span>
-        <span class="value" :class="{ urgent: timeLeft <= 10 }">{{ timeLeft }}</span>
+    <div v-if="screen === 'playing'" class="hud">
+      <div class="hud-row">
+        <span class="tag">{{ String(levelIndex + 1).padStart(2, '0') }}</span>
+        <span class="name">{{ levelName }}</span>
+        <span class="spacer"></span>
+        <span class="tag">Zeit</span>
+        <span class="num" :class="{ urgent: timeLeft <= 10 }">{{ timeLeft }}</span>
       </div>
       <div class="hud-note">
-        <template v-if="shielded">Kern abgeschirmt — {{ targetsLeft }} Ziele offen</template>
+        <template v-if="shielded">Welle {{ wave }} — {{ foes }} Gegner</template>
         <template v-else>Kern offen</template>
       </div>
     </div>
 
-    <div v-if="status !== 'running'" class="overlay">
+    <div v-if="screen !== 'playing'" class="overlay">
       <div class="panel">
-        <template v-if="status === 'ready'">
-          <h1>Hacking</h1>
-          <p class="lead">
-            Linker Daumen bewegt. Rechter Daumen dreht und feuert — loslassen heisst
-            Feuer aus, der Winkel bleibt stehen. Ausweichen gibt es nicht.
-          </p>
-          <ul class="rules">
-            <li><b class="orange">Orange</b> Kugeln lassen sich abschiessen.</li>
-            <li><b class="purple">Violette</b> nicht — nur ausweichen.</li>
-            <li>Massive Blöcke sind Deckung, Umrisse sind zerstörbar.</li>
-            <li>Der Kern ist abgeschirmt, bis alles andere weg ist.</li>
+        <!-- Levelauswahl im Stil der ACCESS POINTS auf der Startseite -->
+        <template v-if="screen === 'menu'">
+          <header class="rule">
+            <span class="tag">Hacking</span>
+            <span class="line"></span>
+            <span class="tag">{{ LEVEL_COUNT }} Sektoren</span>
+          </header>
+          <h1>Zugriffs&shy;punkte</h1>
+
+          <ul class="levels">
+            <li v-for="l in levelList" :key="l.index">
+              <button class="level" :disabled="!l.unlocked" @click="startLevel(l.index)">
+                <span class="idx">{{ String(l.index + 1).padStart(2, '0') }}</span>
+                <span class="body">
+                  <span class="ltitle">{{ l.name }}</span>
+                  <span class="lsub">{{ l.subtitle }}</span>
+                  <span class="lmeta">{{ l.waves }} Wellen</span>
+                </span>
+                <span class="state">
+                  <template v-if="!l.unlocked">gesperrt</template>
+                  <template v-else-if="l.done">geschafft</template>
+                  <template v-else>offen</template>
+                </span>
+              </button>
+            </li>
           </ul>
-          <p class="desktop-hint">Am PC: WASD bewegt, Maus zielt, Maustaste halten feuert.</p>
+
+          <details class="how">
+            <summary>Steuerung und Regeln</summary>
+            <p>
+              Linker Daumen bewegt. Rechter Daumen dreht und feuert zugleich — loslassen
+              heisst Feuer aus, der Winkel bleibt stehen. Ausweichen gibt es nicht.
+            </p>
+            <ul>
+              <li><b class="orange">Orange</b> Kugeln lassen sich abschiessen.</li>
+              <li><b class="purple">Violette</b> nicht — nur ausweichen.</li>
+              <li>Massive Blöcke sind Deckung, Umrisse sind zerstörbar und freiwillig.</li>
+              <li>Der Kern öffnet sich, wenn alle Gegner tot sind.</li>
+              <li>Vier Segmente. Jeder Treffer bricht eines ab, dafür wirst du kleiner.</li>
+            </ul>
+            <p class="dim">Am PC: WASD bewegt, Maus zielt, Maustaste halten feuert.</p>
+          </details>
         </template>
 
-        <template v-else-if="status === 'won'">
-          <h1 class="won">Hack erfolgreich</h1>
-          <p class="lead">Kern zerstört mit {{ timeLeft }} Sekunden Rest.</p>
+        <template v-else-if="screen === 'levelclear'">
+          <header class="rule">
+            <span class="tag">Sektor {{ String(levelIndex + 1).padStart(2, '0') }}</span>
+            <span class="line"></span>
+            <span class="tag">geräumt</span>
+          </header>
+          <h1>Hack erfolgreich</h1>
+          <p class="lead">{{ levelName }} — {{ timeLeft }} Sekunden übrig.</p>
+          <button class="go" @click="startLevel(levelIndex + 1)">Weiter zu Sektor {{ String(levelIndex + 2).padStart(2, '0') }}</button>
+          <button class="ghost" @click="toMenu">Zur Übersicht</button>
+        </template>
+
+        <template v-else-if="screen === 'complete'">
+          <header class="rule">
+            <span class="tag">Alle Sektoren</span>
+            <span class="line"></span>
+            <span class="tag">geräumt</span>
+          </header>
+          <h1>System offen</h1>
+          <p class="lead">Alle {{ LEVEL_COUNT }} Sektoren durchgespielt.</p>
+          <button class="go" @click="toMenu">Zur Übersicht</button>
         </template>
 
         <template v-else>
+          <header class="rule">
+            <span class="tag">Sektor {{ String(levelIndex + 1).padStart(2, '0') }}</span>
+            <span class="line"></span>
+            <span class="tag alarm">Verbindung verloren</span>
+          </header>
           <h1 class="lost">Hack fehlgeschlagen</h1>
           <p class="lead">
-            {{ hp === 0 ? 'Integrität aufgebraucht.' : 'Zeit abgelaufen.' }}
+            {{ lossReason === 'zeit' ? 'Zeit abgelaufen.' : 'Alle Segmente verloren.' }}
           </p>
+          <p class="lead dim" v-if="levelIndex > 0">
+            Ein Sektor zurück. Dein höchster erreichter Sektor bleibt gespeichert.
+          </p>
+          <button class="go" @click="startLevel(fallbackLevel)">
+            Weiter in Sektor {{ String(fallbackLevel + 1).padStart(2, '0') }}
+          </button>
+          <button class="ghost" @click="toMenu">Zur Übersicht</button>
         </template>
-
-        <button class="start" @click="startRound">
-          {{ status === 'ready' ? 'Start' : 'Nochmal' }}
-        </button>
       </div>
     </div>
   </div>
@@ -176,7 +274,7 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #100f0d;
+  background: var(--void);
 }
 
 .surface {
@@ -189,160 +287,292 @@ onBeforeUnmount(() => {
   user-select: none;
 }
 
+/* --- HUD ---------------------------------------------------------------- */
+
 .hud {
   position: absolute;
   inset: 0 0 auto 0;
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  padding: 0.7rem 0.9rem;
+  padding: calc(0.7rem + env(safe-area-inset-top)) calc(0.9rem + env(safe-area-inset-right))
+    0 calc(0.9rem + env(safe-area-inset-left));
   pointer-events: none;
-  font-size: 0.72rem;
-  letter-spacing: 0.14em;
+  color: var(--bone);
+}
+
+.hud-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.tag {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.18em;
   text-transform: uppercase;
-  color: #dcd8c0;
+  color: var(--bone-mute);
 }
 
-.hud-left,
-.hud-right {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
+.tag.alarm {
+  color: var(--sig-text);
 }
 
-.hud-right {
-  margin-left: auto;
+.name {
+  font-family: var(--display);
+  font-size: 1.05rem;
+  letter-spacing: 0.12em;
 }
 
-.label {
-  opacity: 0.55;
-}
-
-.pips {
-  display: flex;
-  gap: 4px;
-}
-
-.pips i {
-  width: 12px;
-  height: 5px;
-  background: #dcd8c0;
-}
-
-.pips i.lost {
-  background: rgba(220, 216, 192, 0.22);
-}
-
-.value {
-  font-variant-numeric: tabular-nums;
+.num {
+  font-family: var(--mono);
   font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
 }
 
-.value.urgent {
-  color: #c1443a;
+.num.urgent {
+  color: var(--sig-text);
 }
 
 .hud-note {
-  position: absolute;
-  top: 2.2rem;
-  left: 0;
-  right: 0;
-  text-align: center;
-  opacity: 0.5;
-  font-size: 0.66rem;
+  margin-top: 0.2rem;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--bone-mute);
 }
+
+/* --- Overlay ------------------------------------------------------------ */
 
 .overlay {
   position: absolute;
   inset: 0;
   display: grid;
   place-items: center;
-  padding: 1.2rem;
-  background: rgba(16, 15, 13, 0.9);
+  padding: calc(1rem + env(safe-area-inset-top)) 1rem calc(1rem + env(safe-area-inset-bottom));
+  background: rgba(16, 15, 13, 0.93);
+  overflow-y: auto;
 }
 
 .panel {
-  width: min(30rem, 100%);
-  max-height: 100%;
-  overflow-y: auto;
-  border: 1px solid rgba(220, 216, 192, 0.28);
-  padding: 1.5rem 1.4rem;
-  color: #dcd8c0;
+  width: min(32rem, 100%);
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  padding: 1.4rem 1.3rem;
+  color: var(--bone);
+}
+
+.rule {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin-bottom: 1.1rem;
+}
+
+.rule .line {
+  flex: 1;
+  height: 1px;
+  background: var(--line);
 }
 
 h1 {
-  margin: 0 0 0.7rem;
-  font-size: 1.5rem;
+  margin: 0 0 1rem;
+  font-family: var(--display);
   font-weight: 400;
-  letter-spacing: 0.2em;
+  font-size: clamp(1.5rem, 6vw, 2.1rem);
+  letter-spacing: 0.14em;
   text-transform: uppercase;
-}
-
-h1.won {
-  color: #dcd8c0;
+  line-height: 1.1;
 }
 
 h1.lost {
-  color: #c1443a;
+  color: var(--sig-text);
 }
 
 .lead {
-  margin: 0 0 1rem;
-  line-height: 1.55;
+  margin: 0 0 0.9rem;
+  font-family: var(--body);
+  line-height: 1.6;
   font-size: 0.9rem;
-  opacity: 0.85;
+  color: var(--bone-dim);
 }
 
-.rules {
-  margin: 0 0 1rem;
-  padding-left: 1.1rem;
-  font-size: 0.84rem;
-  line-height: 1.7;
-  opacity: 0.8;
+.dim {
+  color: var(--bone-mute);
+  font-size: 0.82rem;
 }
 
-.rules b {
-  font-weight: 600;
+/* --- Levelliste --------------------------------------------------------- */
+
+.levels {
+  list-style: none;
+  margin: 0 0 1.1rem;
+  padding: 0;
+  display: grid;
+  gap: 6px;
 }
 
-.orange {
-  color: #e8a33d;
-}
-
-.purple {
-  color: #a87bd1;
-}
-
-.desktop-hint {
-  margin: 0 0 1.2rem;
-  font-size: 0.75rem;
-  opacity: 0.5;
-}
-
-.start {
+.level {
   width: 100%;
-  padding: 0.85rem 1rem;
-  background: #dcd8c0;
-  color: #100f0d;
-  border: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 0.7rem 0.8rem;
+  background: var(--panel-solid);
+  border: 1px solid var(--line);
+  color: var(--bone);
   font: inherit;
-  font-size: 0.85rem;
-  letter-spacing: 0.22em;
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms var(--ease), color 140ms var(--ease);
+}
+
+.level:hover:not(:disabled),
+.level:focus-visible:not(:disabled) {
+  /* Auswahl invertiert auf Knochenweiss, wie im NieR-Menue und auf der Startseite. */
+  background: var(--bone);
+  color: var(--void);
+}
+
+.level:hover:not(:disabled) .lsub,
+.level:hover:not(:disabled) .lmeta,
+.level:hover:not(:disabled) .idx,
+.level:hover:not(:disabled) .state {
+  color: var(--void);
+}
+
+.level:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.idx {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--bone-mute);
+}
+
+.body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.ltitle {
+  font-family: var(--display);
+  font-size: 1.1rem;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
+}
+
+.lsub {
+  font-family: var(--body);
+  font-size: 0.8rem;
+  color: var(--bone-dim);
+}
+
+.lmeta {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  color: var(--bone-mute);
+}
+
+.state {
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--bone-mute);
+  white-space: nowrap;
+}
+
+/* --- Knoepfe ------------------------------------------------------------ */
+
+.go,
+.ghost {
+  width: 100%;
+  padding: 0.8rem 1rem;
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  cursor: pointer;
+  border: 1px solid var(--line-strong);
+}
+
+.go {
+  background: var(--bone);
+  color: var(--void);
+  border-color: var(--bone);
+}
+
+.go:hover,
+.go:focus-visible {
+  background: #fff;
+}
+
+.ghost {
+  margin-top: 6px;
+  background: transparent;
+  color: var(--bone-dim);
+}
+
+.ghost:hover,
+.ghost:focus-visible {
+  color: var(--bone);
+  border-color: var(--bone-dim);
+}
+
+/* --- Aufklappbare Regeln ------------------------------------------------ */
+
+.how {
+  border-top: 1px solid var(--line);
+  padding-top: 0.8rem;
+  font-family: var(--body);
+  font-size: 0.84rem;
+  color: var(--bone-dim);
+}
+
+.how summary {
+  font-family: var(--mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--bone-mute);
   cursor: pointer;
 }
 
-.start:hover,
-.start:focus-visible {
-  background: #fff;
+.how p {
+  margin: 0.7rem 0;
+  line-height: 1.6;
+}
+
+.how ul {
+  margin: 0.6rem 0;
+  padding-left: 1.1rem;
+  line-height: 1.7;
+}
+
+.orange {
+  color: var(--bullet-orange);
+}
+
+.purple {
+  color: var(--bullet-purple);
 }
 
 @media (max-width: 420px) {
   .panel {
-    padding: 1.1rem 1rem;
+    padding: 1.1rem 0.95rem;
   }
-  h1 {
-    font-size: 1.2rem;
+  .ltitle {
+    font-size: 1rem;
   }
 }
 </style>

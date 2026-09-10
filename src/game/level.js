@@ -1,63 +1,94 @@
-import { TUNING, scaleFor } from './config.js'
+import { ENEMY_TYPES, FIRE_PATTERNS, TUNING, scaleFor } from './config.js'
 
-// Baut eine Arena, die sich an die vorhandene Flaeche anpasst. Alle Positionen sind
-// relativ zur Arenagroesse, damit dasselbe Layout hochkant wie quer funktioniert.
-export function buildLevel(width, height) {
+// Baut aus einer Leveldefinition (levels.js) die konkreten Objekte fuer eine
+// bestimmte Arenagroesse. Anteile werden hier zu Pixeln, sonst passiert nichts.
+
+export function buildLevel(def, width, height) {
   const s = scaleFor(width, height)
-  const cx = width / 2
-  const cy = height / 2
+  const shortSide = Math.min(width, height)
 
-  const core = {
-    x: cx,
-    y: cy,
-    radius: TUNING.core.radius * s,
-    hp: TUNING.core.hp,
-    maxHp: TUNING.core.hp,
-    spin: 0,
-    cooldown: 0.8,
-    alive: true,
-  }
-
-  const blocks = []
-  const addBlock = (fx, fy, fw, fh, type) => {
-    blocks.push({
-      x: width * fx,
-      y: height * fy,
-      w: width * fw,
-      h: height * fh,
-      type,
-      hp: type === 'destructible' ? 2 : Infinity,
-      alive: true,
-    })
-  }
-
-  // Deckung: unzerstoerbar, haelt Schuesse auf. Vier Stueck um die Mitte herum.
-  addBlock(0.22, 0.3, 0.1, 0.035, 'cover')
-  addBlock(0.68, 0.3, 0.1, 0.035, 'cover')
-  addBlock(0.22, 0.665, 0.1, 0.035, 'cover')
-  addBlock(0.68, 0.665, 0.1, 0.035, 'cover')
-
-  // Zerstoerbar: schirmen den Kern ab, solange sie stehen.
-  addBlock(0.44, 0.2, 0.12, 0.03, 'destructible')
-  addBlock(0.44, 0.77, 0.12, 0.03, 'destructible')
-  addBlock(0.17, 0.475, 0.03, 0.1, 'destructible')
-  addBlock(0.8, 0.475, 0.03, 0.1, 'destructible')
-
-  const turrets = [
-    { fx: 0.16, fy: 0.18 },
-    { fx: 0.84, fy: 0.18 },
-    { fx: 0.16, fy: 0.82 },
-    { fx: 0.84, fy: 0.82 },
-  ].map((t) => ({
-    x: width * t.fx,
-    y: height * t.fy,
-    radius: TUNING.turret.radius * s,
-    hp: TUNING.turret.hp,
-    maxHp: TUNING.turret.hp,
-    cooldown: 0.6 + Math.random() * 0.9,
-    angle: 0,
+  const blocks = def.blocks.map((b) => ({
+    x: width * b.fx,
+    y: height * b.fy,
+    w: width * b.fw,
+    h: height * b.fh,
+    type: b.type,
+    hp: b.type === 'destructible' ? 2 : Infinity,
+    maxHp: b.type === 'destructible' ? 2 : Infinity,
     alive: true,
   }))
 
-  return { core, blocks, turrets, scale: s }
+  const cores = def.cores.map((c) => ({
+    x: width * c.fx,
+    y: height * c.fy,
+    radius: TUNING.core.radius * s,
+    hp: c.hp,
+    maxHp: c.hp,
+    pattern: c.pattern || 'none',
+    spin: Math.random() * Math.PI * 2,
+    cooldown: 0.8 + Math.random() * 0.6,
+    hitFlash: 0,
+    alive: true,
+  }))
+
+  // Wellen bleiben Baurezepte, bis sie an der Reihe sind.
+  const waves = def.waves.map((wave) =>
+    wave.map((e) => makeEnemySpec(e, width, height, shortSide, s)),
+  )
+
+  return {
+    name: def.name,
+    subtitle: def.subtitle || '',
+    coreFiresDuringWaves: !!def.coreFiresDuringWaves,
+    blocks,
+    cores,
+    waves,
+    scale: s,
+  }
+}
+
+function makeEnemySpec(e, width, height, shortSide, s) {
+  const type = ENEMY_TYPES[e.type]
+  if (!type) throw new Error(`Unbekannter Gegnertyp: ${e.type}`)
+
+  const patternName = e.pattern || (e.type === 'charger' ? 'none' : 'single')
+  const pattern = FIRE_PATTERNS[patternName]
+  if (!pattern) throw new Error(`Unbekanntes Feuermuster: ${patternName}`)
+
+  return {
+    kind: e.type,
+    x: width * e.fx,
+    y: height * e.fy,
+    radius: type.radius * s,
+    hp: type.hp,
+    maxHp: type.hp,
+    speed: type.speedFactor * TUNING.player.speed * s,
+    chargeSpeed: (type.chargeSpeedFactor || 0) * TUNING.player.speed * s,
+    standoff: (type.standoff || 0) * shortSide,
+    contactDamage: type.contactDamage,
+    solid: type.solid,
+    turnRate: type.turnRate,
+    armored: !!e.armored,
+    patternName,
+    pattern,
+    orbitRadius: e.orbit ? shortSide * e.orbit : 0,
+  }
+}
+
+// Aus einem Baurezept wird ein lebender Gegner.
+export function spawnEnemy(spec) {
+  return {
+    ...spec,
+    angle: 0,
+    cooldown: 0.6 + Math.random() * 0.8,
+    burstLeft: 0,
+    burstTimer: 0,
+    chargeState: 'idle', // idle | windup | charging | recover
+    chargeTimer: 0,
+    chargeDx: 0,
+    chargeDy: 0,
+    orbitAngle: Math.random() * Math.PI * 2,
+    hitFlash: 0,
+    alive: true,
+  }
 }
