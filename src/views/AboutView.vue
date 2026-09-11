@@ -6,38 +6,35 @@ import { RouterLink } from 'vue-router'
   <main class="about">
     <div class="inner">
       <header class="rule">
-        <span class="tag">Dori</span>
+        <span class="label">NieR · Hacking</span>
         <span class="line"></span>
-        <span class="tag">Über</span>
+        <span class="label">About</span>
       </header>
 
       <h1>Hacking</h1>
 
       <p>
-        Ein Nachbau des Hacking-Minispiels aus NieR Automata. Top-down, zwei virtuelle
-        Joysticks, gebaut für den Daumen und nicht für die Tastatur.
+        A remake of the hacking minigame from NieR: Automata, rebuilt in 3D for the browser. Top-down, twin-stick,
+        made for thumbs first and keyboards second.
       </p>
       <p>
-        Linker Stick bewegt, rechter Stick dreht und feuert zugleich. Beide sind
-        voneinander unabhängig — nach links laufen und dabei nach rechts schiessen ist
-        der ganze Punkt. Ausweichen gibt es nicht, Bewegung ist das Ausweichen.
+        The left stick moves, the right stick turns and fires at once. They are independent - running left while
+        shooting right is the whole point. There is no dodge roll; moving is the dodge.
       </p>
       <p>
-        Der Spieler ist eine Raute aus vier Segmenten. Jeder Treffer bricht eines ab,
-        auf der Seite, aus der er kam — dafür wird die Trefferfläche kleiner. Man liest
-        seinen Zustand am eigenen Schiff ab, nicht in der Ecke.
+        Your ship is a diamond of four segments. Every hit breaks the one facing it, and the hitbox shrinks with it.
+        You read your state off your own ship, not a bar in the corner.
       </p>
       <p>
-        Fünf Sektoren mit mehreren Wellen. Der Kern öffnet sich, wenn alle Gegner tot
-        sind. Vier Gegnertypen, sechs Feuermuster, und keiner davon ist im Normalzustand
-        so schnell wie du.
+        Ten sectors, each its own world. Three waves in each, then the core wakes up as that sector's guardian.
+        Fourteen kinds of hostiles, ten guardians, and every sector a little faster and meaner than the last.
       </p>
       <p class="dim">
-        Vue 3 und Vite, die Arena ist ein Canvas mit eigener Spielschleife. Mechaniken
-        nachgebaut, alle Grafik selbst gezeichnet.
+        Vue 3 and Vite, three.js for the arena with its own game loop, sound synthesised in the browser. Mechanics
+        rebuilt, every model and effect drawn from scratch. Not affiliated with Square Enix or PlatinumGames.
       </p>
 
-      <RouterLink to="/" class="back">Zurück zum Spiel</RouterLink>
+      <RouterLink to="/" class="back">Back to the game</RouterLink>
     </div>
   </main>
 </template>
@@ -50,13 +47,14 @@ import { RouterLink } from 'vue-router'
   padding: calc(2rem + env(safe-area-inset-top)) 1.2rem calc(2rem + env(safe-area-inset-bottom));
   color: var(--bone);
   overflow-y: auto;
+  height: 100%;
 }
 
 .inner {
-  width: min(34rem, 100%);
+  width: min(36rem, 100%);
   border: 1px solid var(--line-strong);
   background: var(--panel);
-  padding: 1.6rem 1.4rem;
+  padding: 1.8rem 1.6rem;
 }
 
 .rule {
@@ -72,20 +70,12 @@ import { RouterLink } from 'vue-router'
   background: var(--line);
 }
 
-.tag {
-  font-family: var(--mono);
-  font-size: 0.62rem;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--bone-mute);
-}
-
 h1 {
   margin: 0 0 1.2rem;
   font-family: var(--display);
-  font-weight: 400;
-  font-size: clamp(1.6rem, 7vw, 2.2rem);
-  letter-spacing: 0.16em;
+  font-weight: 300;
+  font-size: clamp(1.8rem, 7vw, 2.6rem);
+  letter-spacing: 0.18em;
   text-transform: uppercase;
 }
 
@@ -93,27 +83,29 @@ p {
   margin: 0 0 1rem;
   font-family: var(--body);
   line-height: 1.65;
-  font-size: 0.9rem;
+  font-size: 0.95rem;
   color: var(--bone-dim);
 }
 
 p.dim {
   color: var(--bone-mute);
-  font-size: 0.82rem;
+  font-size: 0.85rem;
 }
 
 .back {
   display: inline-block;
   margin-top: 0.6rem;
   font-family: var(--mono);
-  font-size: 0.66rem;
+  font-size: 0.68rem;
   letter-spacing: 0.18em;
   text-transform: uppercase;
   color: var(--bone-dim);
   text-decoration: none;
   border-bottom: 1px solid var(--line-strong);
   padding-bottom: 3px;
-  transition: color 140ms var(--ease), border-color 140ms var(--ease);
+  transition:
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
 }
 
 .back:hover,

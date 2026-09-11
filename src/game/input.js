@@ -1,34 +1,30 @@
-// Zwei Daumen gleichzeitig: jeder Finger wird ueber seine pointerId verfolgt, damit die
-// beiden Sticks sich nicht gegenseitig ueberschreiben. Das ist der Teil, der bei
-// Touch-Steuerungen am haeufigsten schiefgeht.
+// Every way to steer the ship, merged into one { move, aim } per frame:
+//
+//   touch    two thumbs: left half of the screen moves, right half aims + fires.
+//            Each finger is tracked by its pointerId, so the sticks never
+//            overwrite each other.
+//   keyboard WASD moves, arrow keys aim + fire.
+//   mouse    the ship aims at the cursor, holding the button fires.
+//   gamepad  left stick moves, right stick aims + fires.
+//
+// Whatever was used last wins, so a touchscreen laptop can switch freely.
 
-const STICK_RADIUS = 58
+const STICK_RADIUS = 60
+const DEADZONE = 0.22
 
 function emptyStick() {
-  return {
-    active: false,
-    pointerId: null,
-    originX: 0,
-    originY: 0,
-    knobX: 0,
-    knobY: 0,
-    radius: STICK_RADIUS,
-    vx: 0,
-    vy: 0,
-  }
+  return { active: false, pointerId: null, originX: 0, originY: 0, knobX: 0, knobY: 0, radius: STICK_RADIUS, vx: 0, vy: 0 }
 }
 
 function updateStick(stick, x, y) {
   const dx = x - stick.originX
   const dy = y - stick.originY
-  const dist = Math.hypot(dx, dy)
-
-  if (dist > stick.radius) {
-    // Knopf bleibt am Rand kleben, der Richtungsvektor bleibt auf Laenge 1.
-    stick.knobX = stick.originX + (dx / dist) * stick.radius
-    stick.knobY = stick.originY + (dy / dist) * stick.radius
-    stick.vx = dx / dist
-    stick.vy = dy / dist
+  const d = Math.hypot(dx, dy)
+  if (d > stick.radius) {
+    stick.knobX = stick.originX + (dx / d) * stick.radius
+    stick.knobY = stick.originY + (dy / d) * stick.radius
+    stick.vx = dx / d
+    stick.vy = dy / d
   } else {
     stick.knobX = x
     stick.knobY = y
@@ -44,35 +40,32 @@ function releaseStick(stick) {
   stick.vy = 0
 }
 
-export function createInput(canvas, getPlayerPos) {
+export function createInput(el, { toWorld, getPlayer }) {
   const sticks = { move: emptyStick(), aim: emptyStick() }
   const keys = new Set()
   const mouse = { x: 0, y: 0, inside: false, down: false }
-  let usingTouch = false
+  let mode = 'keys' // keys | touch | pad
+  let padAim = { x: 0, y: -1 }
 
-  const localPoint = (e) => {
-    const rect = canvas.getBoundingClientRect()
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top }
+  const local = (e) => {
+    const r = el.getBoundingClientRect()
+    return { x: e.clientX - r.left, y: e.clientY - r.top }
   }
 
   function onPointerDown(e) {
+    const p = local(e)
     if (e.pointerType === 'mouse') {
-      mouse.down = true
-      const p = localPoint(e)
+      mode = 'keys'
+      mouse.down = e.button === 0 ? true : mouse.down
       mouse.x = p.x
       mouse.y = p.y
       mouse.inside = true
       return
     }
-
-    usingTouch = true
-    const p = localPoint(e)
-    const leftHalf = p.x < canvas.clientWidth / 2
-    // Linke Bildschirmhaelfte steuert die Bewegung, rechte das Zielen. Der Stick
-    // entsteht dort, wo der Daumen aufsetzt - nicht an einer festen Stelle.
-    const stick = leftHalf ? sticks.move : sticks.aim
+    mode = 'touch'
+    // The stick appears where the thumb lands, not at a fixed spot.
+    const stick = p.x < el.clientWidth / 2 ? sticks.move : sticks.aim
     if (stick.active) return
-
     stick.active = true
     stick.pointerId = e.pointerId
     stick.originX = p.x
@@ -81,38 +74,39 @@ export function createInput(canvas, getPlayerPos) {
     stick.knobY = p.y
     stick.vx = 0
     stick.vy = 0
-    canvas.setPointerCapture?.(e.pointerId)
+    el.setPointerCapture?.(e.pointerId)
+    e.preventDefault()
   }
 
   function onPointerMove(e) {
-    const p = localPoint(e)
-
+    const p = local(e)
     if (e.pointerType === 'mouse') {
       mouse.x = p.x
       mouse.y = p.y
       mouse.inside = true
+      if (mode !== 'keys' && (Math.abs(e.movementX) + Math.abs(e.movementY) > 2)) mode = 'keys'
       return
     }
-
-    for (const stick of [sticks.move, sticks.aim]) {
-      if (stick.active && stick.pointerId === e.pointerId) {
-        updateStick(stick, p.x, p.y)
-      }
+    for (const s of [sticks.move, sticks.aim]) {
+      if (s.active && s.pointerId === e.pointerId) updateStick(s, p.x, p.y)
     }
   }
 
   function onPointerUp(e) {
     if (e.pointerType === 'mouse') {
-      mouse.down = false
+      if (e.button === 0) mouse.down = false
       return
     }
-    for (const stick of [sticks.move, sticks.aim]) {
-      if (stick.pointerId === e.pointerId) releaseStick(stick)
-    }
+    for (const s of [sticks.move, sticks.aim]) if (s.pointerId === e.pointerId) releaseStick(s)
   }
 
   function onKeyDown(e) {
-    keys.add(e.key.toLowerCase())
+    const k = e.key.toLowerCase()
+    if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
+      keys.add(k)
+      mode = 'keys'
+      if (k.startsWith('arrow')) e.preventDefault()
+    }
   }
   function onKeyUp(e) {
     keys.delete(e.key.toLowerCase())
@@ -130,51 +124,93 @@ export function createInput(canvas, getPlayerPos) {
     e.preventDefault()
   }
 
-  canvas.addEventListener('pointerdown', onPointerDown)
-  canvas.addEventListener('pointermove', onPointerMove)
-  canvas.addEventListener('pointerup', onPointerUp)
-  canvas.addEventListener('pointercancel', onPointerUp)
-  canvas.addEventListener('pointerleave', onLeave)
-  canvas.addEventListener('contextmenu', onContextMenu)
+  el.addEventListener('pointerdown', onPointerDown)
+  el.addEventListener('pointermove', onPointerMove)
+  el.addEventListener('pointerup', onPointerUp)
+  el.addEventListener('pointercancel', onPointerUp)
+  el.addEventListener('pointerleave', onLeave)
+  el.addEventListener('contextmenu', onContextMenu)
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
   window.addEventListener('blur', onBlur)
 
+  function readPad() {
+    const pads = navigator.getGamepads?.() || []
+    for (const pad of pads) {
+      if (!pad || !pad.connected) continue
+      const ax = pad.axes
+      const mx = Math.abs(ax[0]) > DEADZONE ? ax[0] : 0
+      const my = Math.abs(ax[1]) > DEADZONE ? ax[1] : 0
+      const rx = Math.abs(ax[2] ?? 0) > DEADZONE ? ax[2] : 0
+      const ry = Math.abs(ax[3] ?? 0) > DEADZONE ? ax[3] : 0
+      const trigger = pad.buttons[7]?.pressed || pad.buttons[5]?.pressed
+      const aimLen = Math.hypot(rx, ry)
+      if (aimLen > 0.3) padAim = { x: rx / aimLen, y: ry / aimLen }
+      const used = mx || my || aimLen > 0.3 || trigger
+      if (used) mode = 'pad'
+      if (mode !== 'pad') return null
+      return {
+        move: { x: mx, y: my },
+        aim: { x: padAim.x, y: padAim.y, active: aimLen > 0.3 || !!trigger },
+      }
+    }
+    return null
+  }
+
   return {
     sticks,
+    get mode() {
+      return mode
+    },
 
-    // Wird einmal pro Bild gelesen und in den Zustand gefuettert.
     read() {
-      const move = { x: sticks.move.vx, y: sticks.move.vy }
-      const aim = { x: sticks.aim.vx, y: sticks.aim.vy, active: sticks.aim.active }
+      const pad = readPad()
+      if (pad) return pad
 
-      if (!usingTouch) {
-        // Tastatur und Maus am PC, damit man ohne Handy testen kann.
-        let kx = 0
-        let ky = 0
-        if (keys.has('a') || keys.has('arrowleft')) kx -= 1
-        if (keys.has('d') || keys.has('arrowright')) kx += 1
-        if (keys.has('w') || keys.has('arrowup')) ky -= 1
-        if (keys.has('s') || keys.has('arrowdown')) ky += 1
-        if (kx !== 0 || ky !== 0) {
-          const len = Math.hypot(kx, ky)
-          move.x = kx / len
-          move.y = ky / len
-        }
-
-        if (mouse.down && mouse.inside) {
-          const p = getPlayerPos()
-          const dx = mouse.x - p.x
-          const dy = mouse.y - p.y
-          const len = Math.hypot(dx, dy)
-          if (len > 1) {
-            aim.x = dx / len
-            aim.y = dy / len
-            aim.active = true
-          }
+      if (mode === 'touch') {
+        return {
+          move: { x: sticks.move.vx, y: sticks.move.vy },
+          aim: { x: sticks.aim.vx, y: sticks.aim.vy, active: sticks.aim.active },
         }
       }
 
+      const move = { x: 0, y: 0 }
+      if (keys.has('a')) move.x -= 1
+      if (keys.has('d')) move.x += 1
+      if (keys.has('w')) move.y -= 1
+      if (keys.has('s')) move.y += 1
+      const ml = Math.hypot(move.x, move.y)
+      if (ml > 0) {
+        move.x /= ml
+        move.y /= ml
+      }
+
+      const aim = { x: 0, y: 0, active: false }
+      let kx = 0
+      let ky = 0
+      if (keys.has('arrowleft')) kx -= 1
+      if (keys.has('arrowright')) kx += 1
+      if (keys.has('arrowup')) ky -= 1
+      if (keys.has('arrowdown')) ky += 1
+      if (kx || ky) {
+        const l = Math.hypot(kx, ky)
+        aim.x = kx / l
+        aim.y = ky / l
+        aim.active = true
+      } else if (mouse.inside) {
+        const p = getPlayer()
+        const w = p && toWorld(mouse.x, mouse.y)
+        if (w) {
+          const dx = w.x - p.x
+          const dy = w.y - p.y
+          const l = Math.hypot(dx, dy)
+          if (l > 0.05) {
+            aim.x = dx / l
+            aim.y = dy / l
+            aim.active = mouse.down
+          }
+        }
+      }
       return { move, aim }
     },
 
@@ -183,12 +219,12 @@ export function createInput(canvas, getPlayerPos) {
     },
 
     destroy() {
-      canvas.removeEventListener('pointerdown', onPointerDown)
-      canvas.removeEventListener('pointermove', onPointerMove)
-      canvas.removeEventListener('pointerup', onPointerUp)
-      canvas.removeEventListener('pointercancel', onPointerUp)
-      canvas.removeEventListener('pointerleave', onLeave)
-      canvas.removeEventListener('contextmenu', onContextMenu)
+      el.removeEventListener('pointerdown', onPointerDown)
+      el.removeEventListener('pointermove', onPointerMove)
+      el.removeEventListener('pointerup', onPointerUp)
+      el.removeEventListener('pointercancel', onPointerUp)
+      el.removeEventListener('pointerleave', onLeave)
+      el.removeEventListener('contextmenu', onContextMenu)
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
       window.removeEventListener('blur', onBlur)

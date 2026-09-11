@@ -1,270 +1,492 @@
 <script setup>
-import { onMounted, onBeforeUnmount, ref, shallowRef, computed } from 'vue'
-import { createGame, update, resize, isShielded, enemiesLeft, waveLabel } from '@/game/engine.js'
-import { render } from '@/game/render.js'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { createGame, debugClearWave, debugSkipToBoss, drainEvents, enemiesLeft, LEVEL_COUNT, update } from '@/game/engine.js'
+import { LEVELS } from '@/game/levels.js'
+import { THEMES } from '@/game/themes.js'
+import { bossPhaseMarks } from '@/game/bosses.js'
 import { createInput } from '@/game/input.js'
-import { LEVELS, LEVEL_COUNT } from '@/game/levels.js'
-import { loadProgress, rememberReached, rememberCleared } from '@/game/progress.js'
+import { createAudio } from '@/game/audio.js'
+import { loadProgress, rememberCleared, resetProgress } from '@/game/progress.js'
+import GameHud from './GameHud.vue'
+import SectorMenu from './SectorMenu.vue'
 
-// Die Grenze zwischen Vue und Spiel: Vue verwaltet Menue und Anzeige, alles innerhalb
-// des Canvas laeuft ueber requestAnimationFrame und ruehrt die Reaktivitaet nicht an.
-// Der Spielzustand liegt bewusst in shallowRef - Vue soll ihn nicht durchdringen.
+// The border between Vue and the game: Vue owns menus, panels and the HUD;
+// everything inside the canvas runs on requestAnimationFrame and never
+// touches reactivity. The game object is a plain variable on purpose.
 
-const canvasEl = ref(null)
-const game = shallowRef(null)
+const stageEl = ref(null)
+const glEl = ref(null)
+const uiEl = ref(null)
 
-const screen = ref('menu') // menu | playing | levelclear | complete | lost
-const highest = ref(0)
-const cleared = ref([])
-const levelIndex = ref(0)
+const screen = ref('menu') // menu | playing | paused | won | lost | complete
+const progress = reactive(loadProgress())
+const selected = ref(progress.highest)
+const muted = ref(false)
+const failed = ref(false)
+const result = ref(null)
+const banner = ref(null)
+const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false
+const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
 
-const levelName = ref('')
-const levelSub = ref('')
-const timeLeft = ref(0)
-const wave = ref('')
-const foes = ref(0)
-const shielded = ref(true)
-const lossReason = ref('')
+const hud = reactive({
+  index: 1,
+  count: LEVEL_COUNT,
+  name: '',
+  world: '',
+  wave: 1,
+  waves: 3,
+  waveDone: false,
+  phase: 'intro',
+  time: 0,
+  segMask: 15,
+  hitPulse: 0,
+  foes: 0,
+  boss: null,
+})
 
-let ctx = null
+let renderer = null
 let input = null
-let frameId = null
-let lastTime = 0
+let audio = null
+let game = null
+let frameId = 0
+let last = 0
 let observer = null
+let bannerTimer = 0
+let previewTimer = 0
 
-// Nach einer Niederlage geht es ein Level zurueck - aber das hoechste je erreichte
-// Level bleibt gespeichert. Der Rueckwurf gilt fuer den Durchgang, nicht fuer den
-// Fortschritt.
-const fallbackLevel = computed(() => Math.max(0, levelIndex.value - 1))
+const sectorIndex = computed(() => (screen.value === 'menu' ? selected.value : hud.index - 1))
+const accent = computed(() => THEMES[LEVELS[sectorIndex.value]?.theme]?.ui ?? '#e0574f')
+const lightWorld = computed(() => !!THEMES[LEVELS[sectorIndex.value]?.theme]?.light2)
 
-const levelList = computed(() =>
-  LEVELS.map((l, i) => ({
-    index: i,
-    name: l.name,
-    subtitle: l.subtitle,
-    waves: l.waves.length,
-    unlocked: i <= highest.value,
-    done: cleared.value.includes(i),
-  })),
-)
-
-function refreshProgress() {
-  const p = loadProgress()
-  highest.value = p.highest
-  cleared.value = p.cleared
+const pad = (n) => String(n).padStart(2, '0')
+function fmt(s) {
+  if (typeof s !== 'number') return '--:--.-'
+  const m = Math.floor(s / 60)
+  return `${pad(m)}:${(s - m * 60).toFixed(1).padStart(4, '0')}`
 }
 
-function syncHud() {
-  const g = game.value
-  if (!g) return
-  timeLeft.value = Math.ceil(g.timeLeft)
-  wave.value = waveLabel(g)
-  foes.value = enemiesLeft(g)
-  shielded.value = isShielded(g)
+function stageAspect() {
+  const r = stageEl.value.getBoundingClientRect()
+  return r.width / Math.max(1, r.height)
+}
 
-  if (g.status === 'levelclear' && screen.value === 'playing') {
-    rememberCleared(g.levelIndex)
-    refreshProgress()
-    screen.value = g.levelIndex >= LEVEL_COUNT - 1 ? 'complete' : 'levelclear'
-  } else if (g.status === 'lost' && screen.value === 'playing') {
-    lossReason.value = g.lossReason
+// Space the HUD rows take, so the camera frames the arena between them.
+function applyInsets() {
+  if (!renderer) return
+  const r = stageEl.value.getBoundingClientRect()
+  if (screen.value === 'menu') {
+    renderer.setInsets(8, 8)
+    return
+  }
+  // On a short screen the HUD rows would eat a third of the height; cap them.
+  const small = r.width < 640
+  renderer.setInsets(Math.round(Math.min(small ? 70 : 84, r.height * 0.13)), Math.round(Math.min(small ? 58 : 70, r.height * 0.11)))
+}
+
+function showPreview(i) {
+  game = createGame(i, stageAspect(), { preview: true })
+}
+
+function selectSector(i) {
+  if (i === selected.value) return
+  selected.value = i
+  clearTimeout(previewTimer)
+  // Building a world takes a moment; wait until the pointer settles.
+  previewTimer = setTimeout(() => {
+    if (screen.value === 'menu') showPreview(selected.value)
+  }, 120)
+}
+
+function showBanner(b, ms) {
+  banner.value = { ...b, id: performance.now() }
+  clearTimeout(bannerTimer)
+  bannerTimer = setTimeout(() => (banner.value = null), ms)
+}
+
+function startSector(i) {
+  if (i > progress.highest) return
+  audio?.unlock()
+  audio?.ui()
+  selected.value = i
+  const def = LEVELS[i]
+  game = createGame(i, stageAspect(), { reduced })
+  Object.assign(hud, {
+    index: i + 1,
+    name: def.name,
+    world: THEMES[def.theme].name,
+    wave: 1,
+    waves: def.waves.length,
+    waveDone: false,
+    phase: 'intro',
+    time: 0,
+    segMask: 15,
+    hitPulse: 0,
+    foes: 0,
+    boss: null,
+  })
+  result.value = null
+  input?.reset()
+  screen.value = 'playing'
+  applyInsets()
+  last = performance.now()
+  showBanner({ kind: 'sector', index: i + 1, title: def.name, sub: def.subtitle, world: THEMES[def.theme].name }, 2300)
+}
+
+function toMenu() {
+  audio?.ui()
+  screen.value = 'menu'
+  banner.value = null
+  Object.assign(progress, loadProgress())
+  if (selected.value > progress.highest) selected.value = progress.highest
+  showPreview(selected.value)
+  applyInsets()
+}
+
+function pause() {
+  if (screen.value !== 'playing') return
+  screen.value = 'paused'
+  input?.reset()
+  audio?.ui()
+}
+
+function resume() {
+  if (screen.value !== 'paused') return
+  screen.value = 'playing'
+  last = performance.now()
+  audio?.ui()
+}
+
+function toggleMute() {
+  audio?.setMuted(!muted.value)
+  muted.value = !!audio?.muted
+}
+
+function onReset() {
+  resetProgress()
+  Object.assign(progress, loadProgress())
+  selected.value = 0
+  showPreview(0)
+}
+
+// ---------------------------------------------------------------------------
+// Loop
+// ---------------------------------------------------------------------------
+
+function syncHud() {
+  const g = game
+  if (!g || g.phase === 'preview') return
+  hud.phase = g.phase
+  hud.wave = Math.max(1, g.waveIndex + 1)
+  hud.waveDone = g.waveIndex >= 0 && g.clearedWave >= g.waveIndex
+  hud.time = Math.floor(g.time * 10) / 10
+  let mask = 0
+  g.player.segments.forEach((s, i) => {
+    if (s) mask |= 1 << i
+  })
+  hud.segMask = mask
+  hud.foes = enemiesLeft(g)
+  const B = g.boss
+  if (B) {
+    const frac = Math.max(0, Math.round((B.hp / B.maxHp) * 1000) / 1000)
+    if (!hud.boss) hud.boss = { name: B.name, title: B.def.title, frac, marks: bossPhaseMarks(B.id), phase: B.phase }
+    else {
+      hud.boss.frac = frac
+      hud.boss.phase = B.phase
+    }
+  } else if (hud.boss) {
+    hud.boss = null
+  }
+}
+
+function onEvents(events) {
+  for (const ev of events) {
+    if (ev.type === 'wave') showBanner({ kind: 'wave', index: ev.index + 1, total: ev.total }, 1700)
+    else if (ev.type === 'waveClear' && ev.index + 1 < ev.total) showBanner({ kind: 'cleared' }, 900)
+    else if (ev.type === 'awaken') showBanner({ kind: 'warning', title: ev.name, sub: ev.title }, 3400)
+    else if (ev.type === 'bossPhase') showBanner({ kind: 'phase', index: ev.index + 1, sub: 'The guardian changes' }, 1400)
+    else if (ev.type === 'playerHit') hud.hitPulse += 1
+  }
+}
+
+function checkEnd() {
+  if (screen.value !== 'playing' || !game) return
+  if (game.status === 'won') {
+    const record = rememberCleared(game.levelIndex, game.time)
+    Object.assign(progress, loadProgress())
+    result.value = {
+      index: game.levelIndex,
+      time: game.time,
+      damage: game.stats.damage,
+      kills: game.stats.kills,
+      record,
+      best: progress.best[game.levelIndex],
+    }
+    screen.value = game.levelIndex >= LEVEL_COUNT - 1 ? 'complete' : 'won'
+  } else if (game.status === 'lost') {
+    const B = game.boss
+    result.value = {
+      index: game.levelIndex,
+      time: game.time,
+      kills: game.stats.kills,
+      reached: B ? `${B.name} at ${Math.max(1, Math.round((B.hp / B.maxHp) * 100))}%` : `Wave ${Math.max(1, game.waveIndex + 1)} of ${game.waveCount}`,
+    }
     screen.value = 'lost'
   }
 }
 
-function canvasSize() {
-  const rect = canvasEl.value.getBoundingClientRect()
-  return {
-    w: Math.max(2, Math.round(rect.width)),
-    h: Math.max(2, Math.round(rect.height)),
+function drawSticks() {
+  const c = uiEl.value
+  if (!c) return
+  const ctx = c.getContext('2d')
+  ctx.clearRect(0, 0, c.width, c.height)
+  if (screen.value !== 'playing' || !input || input.mode !== 'touch') return
+  const dpr = c.width / Math.max(1, c.clientWidth)
+  ctx.save()
+  ctx.scale(dpr, dpr)
+  for (const s of [input.sticks.move, input.sticks.aim]) {
+    if (!s.active) continue
+    ctx.strokeStyle = 'rgba(220, 216, 192, 0.35)'
+    ctx.lineWidth = 1.5
+    ctx.beginPath()
+    ctx.arc(s.originX, s.originY, s.radius, 0, Math.PI * 2)
+    ctx.stroke()
+    ctx.fillStyle = 'rgba(220, 216, 192, 0.28)'
+    ctx.beginPath()
+    ctx.arc(s.knobX, s.knobY, s.radius * 0.36, 0, Math.PI * 2)
+    ctx.fill()
   }
+  ctx.restore()
 }
 
-function fitCanvas() {
-  const canvas = canvasEl.value
-  if (!canvas) return
-  const { w, h } = canvasSize()
-
-  // Auf Bildschirmen mit hoher Pixeldichte wird der Puffer groesser gezeichnet und
-  // anschliessend heruntergerechnet, sonst sehen die duennen Linien matschig aus.
-  const dpr = Math.min(window.devicePixelRatio || 1, 2)
-  canvas.width = Math.round(w * dpr)
-  canvas.height = Math.round(h * dpr)
-  ctx = canvas.getContext('2d')
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-
-  if (!game.value) game.value = createGame(0, w, h)
-  else resize(game.value, w, h)
-  syncHud()
-}
+// Dev builds only: a bot can take the controls for testing.
+let autopilot = null
 
 function loop(now) {
   frameId = requestAnimationFrame(loop)
-  const g = game.value
-  if (!g || !ctx) return
+  const dt = Math.min(0.1, (now - last) / 1000 || 0)
+  last = now
+  tick(dt)
+}
 
-  // Nach einem Tabwechsel kann der Abstand sehr gross sein. Deckeln, sonst springen
-  // Kugeln in einem Bild durch die halbe Arena und Kollisionen werden verpasst.
-  const dt = Math.min(0.05, (now - lastTime) / 1000 || 0)
-  lastTime = now
+function tick(dt) {
+  if (!game || !renderer) return
 
-  if (g.status === 'running') update(g, dt, input.read())
-  render(ctx, g, input.sticks)
+  let events = null
+  if (screen.value === 'playing') {
+    update(game, dt, autopilot ? autopilot(game) : input.read())
+    events = drainEvents(game)
+    if (events.length) {
+      audio.playAll(events)
+      onEvents(events)
+    }
+  }
+  renderer.frame(game, dt, events, { paused: screen.value === 'paused' })
+  drawSticks()
   syncHud()
+  checkEnd()
 }
 
-function startLevel(i) {
-  const { w, h } = canvasSize()
-  const g = createGame(i, w, h)
-  g.status = 'running'
-  game.value = g
-  levelIndex.value = i
-  levelName.value = g.levelName
-  levelSub.value = g.levelSubtitle
-  rememberReached(i)
-  refreshProgress()
-  input.reset()
-  lastTime = performance.now()
-  screen.value = 'playing'
-  syncHud()
+function fit() {
+  const el = stageEl.value
+  if (!el || !renderer) return
+  const r = el.getBoundingClientRect()
+  renderer.setSize(r.width, r.height)
+  const dpr = Math.min(window.devicePixelRatio || 1, 2)
+  uiEl.value.width = Math.round(r.width * dpr)
+  uiEl.value.height = Math.round(r.height * dpr)
+  applyInsets()
+  // Turning the phone in the menu flips the preview arena too.
+  if (screen.value === 'menu' && game && game.portrait !== stageAspect() < 0.95) showPreview(selected.value)
+  // Resizing clears the canvas; draw straight away instead of leaving a blank frame.
+  if (game) renderer.frame(game, 0, null, { paused: true })
 }
 
-function toMenu() {
-  refreshProgress()
-  screen.value = 'menu'
+function onKey(e) {
+  if (e.key === 'Escape' || e.key === 'p' || e.key === 'P') {
+    if (screen.value === 'playing') {
+      e.preventDefault()
+      pause()
+    } else if (screen.value === 'paused') {
+      e.preventDefault()
+      resume()
+    }
+  }
 }
 
-onMounted(() => {
-  const canvas = canvasEl.value
-  input = createInput(canvas, () => ({
-    x: game.value ? game.value.player.x : 0,
-    y: game.value ? game.value.player.y : 0,
-  }))
+function onVisibility() {
+  if (document.hidden) pause()
+}
 
-  refreshProgress()
-  fitCanvas()
+function onFirstInput() {
+  audio?.unlock()
+}
 
-  observer = new ResizeObserver(() => fitCanvas())
-  observer.observe(canvas)
-
-  lastTime = performance.now()
+onMounted(async () => {
+  audio = createAudio()
+  muted.value = audio.muted
+  try {
+    const { createRenderer } = await import('@/game/render3d/index.js')
+    renderer = createRenderer(glEl.value, { reduced })
+  } catch (err) {
+    console.error('3D renderer unavailable', err)
+    failed.value = true
+    return
+  }
+  input = createInput(glEl.value, {
+    toWorld: (x, y) => renderer.screenToWorld(x, y),
+    getPlayer: () => (game ? game.player : null),
+  })
+  observer = new ResizeObserver(fit)
+  observer.observe(stageEl.value)
+  fit()
+  showPreview(selected.value)
+  last = performance.now()
   frameId = requestAnimationFrame(loop)
+
+  window.addEventListener('keydown', onKey)
+  window.addEventListener('pointerdown', onFirstInput, { once: true })
+  window.addEventListener('keydown', onFirstInput, { once: true })
+  document.addEventListener('visibilitychange', onVisibility)
+
+  if (import.meta.env.DEV) {
+    const bot = await import('@/game/devbot.js')
+    window.__dori = {
+      // Advance the loop by hand - for testing where the tab gets no frames.
+      step: (sec = 1, fps = 60) => {
+        for (let i = 0; i < sec * fps; i++) tick(1 / fps)
+        return game && { phase: game.phase, wave: game.waveIndex + 1, time: +game.time.toFixed(1), status: game.status, screen: screen.value }
+      },
+      autopilot: (on = true) => {
+        autopilot = on ? bot.botInput : null
+      },
+      start: (i) => startSector(i),
+      unlockAll: () => {
+        progress.highest = LEVEL_COUNT - 1
+      },
+      boss: () => game && debugSkipToBoss(game),
+      clearWave: () => game && debugClearWave(game),
+      god: (on = true) => game && (game.god = on),
+      game: () => game,
+      r: () => renderer,
+    }
+  }
 })
 
 onBeforeUnmount(() => {
-  if (frameId) cancelAnimationFrame(frameId)
+  cancelAnimationFrame(frameId)
+  clearTimeout(bannerTimer)
+  clearTimeout(previewTimer)
   observer?.disconnect()
   input?.destroy()
+  renderer?.dispose()
+  audio?.dispose()
+  window.removeEventListener('keydown', onKey)
+  window.removeEventListener('pointerdown', onFirstInput)
+  window.removeEventListener('keydown', onFirstInput)
+  document.removeEventListener('visibilitychange', onVisibility)
 })
 </script>
 
 <template>
-  <div class="stage">
-    <canvas ref="canvasEl" class="surface"></canvas>
+  <div ref="stageEl" class="stage" :class="{ 'is-light': lightWorld }" :style="{ '--accent': accent }">
+    <canvas
+      ref="glEl"
+      class="surface"
+      :aria-label="screen === 'playing' ? 'Hacking arena. Move with W A S D, aim and fire with the arrow keys or the mouse. Escape pauses.' : 'Sector preview'"
+      role="img"
+    ></canvas>
+    <canvas ref="uiEl" class="sticks" aria-hidden="true"></canvas>
+    <div class="scanlines" aria-hidden="true"></div>
 
-    <div v-if="screen === 'playing'" class="hud">
-      <div class="hud-row">
-        <span class="tag">{{ String(levelIndex + 1).padStart(2, '0') }}</span>
-        <span class="name">{{ levelName }}</span>
-        <span class="spacer"></span>
-        <span class="tag">Zeit</span>
-        <span class="num" :class="{ urgent: timeLeft <= 10 }">{{ timeLeft }}</span>
-      </div>
-      <div class="hud-note">
-        <template v-if="shielded">Welle {{ wave }} — {{ foes }} Gegner</template>
-        <template v-else>Kern offen</template>
-      </div>
-    </div>
-
-    <div v-if="screen !== 'playing'" class="overlay">
+    <div v-if="failed" class="overlay">
       <div class="panel">
-        <!-- Levelauswahl im Stil der ACCESS POINTS auf der Startseite -->
-        <template v-if="screen === 'menu'">
-          <header class="rule">
-            <span class="tag">Hacking</span>
-            <span class="line"></span>
-            <span class="tag">{{ LEVEL_COUNT }} Sektoren</span>
-          </header>
-          <h1>Zugriffs&shy;punkte</h1>
-
-          <ul class="levels">
-            <li v-for="l in levelList" :key="l.index">
-              <button class="level" :disabled="!l.unlocked" @click="startLevel(l.index)">
-                <span class="idx">{{ String(l.index + 1).padStart(2, '0') }}</span>
-                <span class="body">
-                  <span class="ltitle">{{ l.name }}</span>
-                  <span class="lsub">{{ l.subtitle }}</span>
-                  <span class="lmeta">{{ l.waves }} Wellen</span>
-                </span>
-                <span class="state">
-                  <template v-if="!l.unlocked">gesperrt</template>
-                  <template v-else-if="l.done">geschafft</template>
-                  <template v-else>offen</template>
-                </span>
-              </button>
-            </li>
-          </ul>
-
-          <details class="how">
-            <summary>Steuerung und Regeln</summary>
-            <p>
-              Linker Daumen bewegt. Rechter Daumen dreht und feuert zugleich — loslassen
-              heisst Feuer aus, der Winkel bleibt stehen. Ausweichen gibt es nicht.
-            </p>
-            <ul>
-              <li><b class="orange">Orange</b> Kugeln lassen sich abschiessen.</li>
-              <li><b class="purple">Violette</b> nicht — nur ausweichen.</li>
-              <li>Massive Blöcke sind Deckung, Umrisse sind zerstörbar und freiwillig.</li>
-              <li>Der Kern öffnet sich, wenn alle Gegner tot sind.</li>
-              <li>Vier Segmente. Jeder Treffer bricht eines ab, dafür wirst du kleiner.</li>
-            </ul>
-            <p class="dim">Am PC: WASD bewegt, Maus zielt, Maustaste halten feuert.</p>
-          </details>
-        </template>
-
-        <template v-else-if="screen === 'levelclear'">
-          <header class="rule">
-            <span class="tag">Sektor {{ String(levelIndex + 1).padStart(2, '0') }}</span>
-            <span class="line"></span>
-            <span class="tag">geräumt</span>
-          </header>
-          <h1>Hack erfolgreich</h1>
-          <p class="lead">{{ levelName }} — {{ timeLeft }} Sekunden übrig.</p>
-          <button class="go" @click="startLevel(levelIndex + 1)">Weiter zu Sektor {{ String(levelIndex + 2).padStart(2, '0') }}</button>
-          <button class="ghost" @click="toMenu">Zur Übersicht</button>
-        </template>
-
-        <template v-else-if="screen === 'complete'">
-          <header class="rule">
-            <span class="tag">Alle Sektoren</span>
-            <span class="line"></span>
-            <span class="tag">geräumt</span>
-          </header>
-          <h1>System offen</h1>
-          <p class="lead">Alle {{ LEVEL_COUNT }} Sektoren durchgespielt.</p>
-          <button class="go" @click="toMenu">Zur Übersicht</button>
-        </template>
-
-        <template v-else>
-          <header class="rule">
-            <span class="tag">Sektor {{ String(levelIndex + 1).padStart(2, '0') }}</span>
-            <span class="line"></span>
-            <span class="tag alarm">Verbindung verloren</span>
-          </header>
-          <h1 class="lost">Hack fehlgeschlagen</h1>
-          <p class="lead">
-            {{ lossReason === 'zeit' ? 'Zeit abgelaufen.' : 'Alle Segmente verloren.' }}
-          </p>
-          <p class="lead dim" v-if="levelIndex > 0">
-            Ein Sektor zurück. Dein höchster erreichter Sektor bleibt gespeichert.
-          </p>
-          <button class="go" @click="startLevel(fallbackLevel)">
-            Weiter in Sektor {{ String(fallbackLevel + 1).padStart(2, '0') }}
-          </button>
-          <button class="ghost" @click="toMenu">Zur Übersicht</button>
-        </template>
+        <span class="label">Connection refused</span>
+        <h2>This browser can't run the arena</h2>
+        <p class="lead">The game needs WebGL 2. Try a current version of Chrome, Safari, Firefox or Edge, or turn on hardware acceleration.</p>
       </div>
     </div>
+
+    <SectorMenu
+      v-if="screen === 'menu' && !failed"
+      :progress="progress"
+      :selected="selected"
+      :muted="muted"
+      :touch="coarse"
+      @select="selectSector"
+      @start="startSector"
+      @mute="toggleMute"
+      @reset="onReset"
+    />
+
+    <GameHud
+      v-if="screen === 'playing' || screen === 'paused'"
+      :hud="hud"
+      :banner="banner"
+      :muted="muted"
+      :touch="coarse"
+      @pause="pause"
+      @mute="toggleMute"
+    />
+
+    <Transition name="panel">
+      <div v-if="screen === 'paused'" class="overlay" @click.self="resume">
+        <div class="panel" role="dialog" aria-modal="true" aria-labelledby="pause-title">
+          <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+          <span class="label">Sector {{ pad(hud.index) }} · {{ hud.name }}</span>
+          <h2 id="pause-title">Paused</h2>
+          <div class="actions">
+            <button type="button" class="btn solid" autofocus @click="resume">Resume</button>
+            <button type="button" class="btn" @click="startSector(hud.index - 1)">Restart sector</button>
+            <button type="button" class="btn" @click="toMenu">Sectors</button>
+          </div>
+          <button type="button" class="link" @click="toggleMute">Sound: {{ muted ? 'off' : 'on' }}</button>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="panel">
+      <div v-if="(screen === 'won' || screen === 'complete') && result" class="overlay">
+        <div class="panel" role="dialog" aria-modal="true" aria-labelledby="won-title">
+          <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+          <span class="label accent">{{ screen === 'complete' ? 'All sectors breached' : `Sector ${pad(result.index + 1)} breached` }}</span>
+          <h2 id="won-title">{{ screen === 'complete' ? 'System open' : 'Hacking complete' }}</h2>
+          <p v-if="result.record" class="record">New best time</p>
+          <dl class="stats">
+            <div><dt class="label">Time</dt><dd>{{ fmt(result.time) }}</dd></div>
+            <div><dt class="label">Best</dt><dd>{{ fmt(result.best) }}</dd></div>
+            <div><dt class="label">Hits taken</dt><dd>{{ result.damage }}</dd></div>
+            <div><dt class="label">Kills</dt><dd>{{ result.kills }}</dd></div>
+          </dl>
+          <p v-if="screen === 'complete'" class="lead">Ten sectors, ten guardians. The core is yours.</p>
+          <div class="actions">
+            <button v-if="screen === 'won'" type="button" class="btn solid" autofocus @click="startSector(result.index + 1)">
+              Next: sector {{ pad(result.index + 2) }}
+            </button>
+            <button type="button" class="btn" @click="startSector(result.index)">Replay</button>
+            <button type="button" class="btn" @click="toMenu">Sectors</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="panel">
+      <div v-if="screen === 'lost' && result" class="overlay">
+        <div class="panel" role="dialog" aria-modal="true" aria-labelledby="lost-title">
+          <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+          <span class="label warn">Connection severed</span>
+          <h2 id="lost-title" class="warn">Hacking failed</h2>
+          <dl class="stats three">
+            <div><dt class="label">Reached</dt><dd>{{ result.reached }}</dd></div>
+            <div><dt class="label">Time</dt><dd>{{ fmt(result.time) }}</dd></div>
+            <div><dt class="label">Kills</dt><dd>{{ result.kills }}</dd></div>
+          </dl>
+          <div class="actions">
+            <button type="button" class="btn solid" autofocus @click="startSector(result.index)">Retry</button>
+            <button type="button" class="btn" @click="toMenu">Sectors</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -275,304 +497,236 @@ onBeforeUnmount(() => {
   height: 100%;
   overflow: hidden;
   background: var(--void);
+  --accent: #e0574f;
+}
+
+.surface,
+.sticks {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 .surface {
-  display: block;
-  width: 100%;
-  height: 100%;
-  /* Ohne das scrollt und zoomt die Seite, sobald zwei Daumen aufsetzen. */
+  /* Without this the page scrolls and zooms as soon as two thumbs land. */
   touch-action: none;
   -webkit-user-select: none;
   user-select: none;
+  outline: none;
 }
 
-/* --- HUD ---------------------------------------------------------------- */
-
-.hud {
-  position: absolute;
-  inset: 0 0 auto 0;
-  padding: calc(0.7rem + env(safe-area-inset-top)) calc(0.9rem + env(safe-area-inset-right))
-    0 calc(0.9rem + env(safe-area-inset-left));
+.sticks {
   pointer-events: none;
-  color: var(--bone);
 }
 
-.hud-row {
-  display: flex;
-  align-items: baseline;
-  gap: 0.6rem;
+.scanlines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(to bottom, rgba(0, 0, 0, 0.12) 0 1px, transparent 1px 3px);
+  mix-blend-mode: multiply;
+  opacity: 0.55;
 }
 
-.spacer {
-  flex: 1;
+.is-light .scanlines {
+  opacity: 0.25;
 }
 
-.tag {
-  font-family: var(--mono);
-  font-size: 0.62rem;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--bone-mute);
-}
-
-.tag.alarm {
-  color: var(--sig-text);
-}
-
-.name {
-  font-family: var(--display);
-  font-size: 1.05rem;
-  letter-spacing: 0.12em;
-}
-
-.num {
-  font-family: var(--mono);
-  font-size: 0.95rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.num.urgent {
-  color: var(--sig-text);
-}
-
-.hud-note {
-  margin-top: 0.2rem;
-  font-family: var(--mono);
-  font-size: 0.62rem;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--bone-mute);
-}
-
-/* --- Overlay ------------------------------------------------------------ */
+/* ---------- panels ---------- */
 
 .overlay {
   position: absolute;
   inset: 0;
+  z-index: 40;
   display: grid;
   place-items: center;
-  padding: calc(1rem + env(safe-area-inset-top)) 1rem calc(1rem + env(safe-area-inset-bottom));
-  background: rgba(16, 15, 13, 0.93);
-  overflow-y: auto;
+  padding: calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom));
+  background: radial-gradient(ellipse at center, rgba(16, 15, 13, 0.55), rgba(16, 15, 13, 0.88));
+  backdrop-filter: blur(3px);
 }
 
 .panel {
-  width: min(32rem, 100%);
+  position: relative;
+  width: min(520px, 100%);
+  padding: clamp(24px, 4vw, 40px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-3);
+  text-align: center;
+  background: rgba(16, 15, 13, 0.9);
   border: 1px solid var(--line-strong);
-  background: var(--panel);
-  padding: 1.4rem 1.3rem;
   color: var(--bone);
 }
 
-.rule {
-  display: flex;
-  align-items: center;
-  gap: 0.8rem;
-  margin-bottom: 1.1rem;
+.corner {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border: 0 solid var(--bone);
 }
+.corner.tl { top: -1px; left: -1px; border-top-width: 2px; border-left-width: 2px; }
+.corner.tr { top: -1px; right: -1px; border-top-width: 2px; border-right-width: 2px; }
+.corner.bl { bottom: -1px; left: -1px; border-bottom-width: 2px; border-left-width: 2px; }
+.corner.br { bottom: -1px; right: -1px; border-bottom-width: 2px; border-right-width: 2px; }
 
-.rule .line {
-  flex: 1;
-  height: 1px;
-  background: var(--line);
-}
-
-h1 {
-  margin: 0 0 1rem;
+h2 {
+  margin: 0;
   font-family: var(--display);
-  font-weight: 400;
-  font-size: clamp(1.5rem, 6vw, 2.1rem);
-  letter-spacing: 0.14em;
+  font-weight: 300;
+  font-size: clamp(2rem, 6vw, 3rem);
+  letter-spacing: 0.18em;
   text-transform: uppercase;
-  line-height: 1.1;
+  line-height: 1.05;
+  margin-right: -0.18em;
+  text-wrap: balance;
 }
 
-h1.lost {
+.warn {
   color: var(--sig-text);
 }
 
-.lead {
-  margin: 0 0 0.9rem;
-  font-family: var(--body);
-  line-height: 1.6;
-  font-size: 0.9rem;
-  color: var(--bone-dim);
+.accent {
+  color: var(--accent);
 }
 
-.dim {
-  color: var(--bone-mute);
-  font-size: 0.82rem;
-}
-
-/* --- Levelliste --------------------------------------------------------- */
-
-.levels {
-  list-style: none;
-  margin: 0 0 1.1rem;
-  padding: 0;
-  display: grid;
-  gap: 6px;
-}
-
-.level {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 0.9rem;
-  padding: 0.7rem 0.8rem;
-  background: var(--panel-solid);
-  border: 1px solid var(--line);
-  color: var(--bone);
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-  transition: background 140ms var(--ease), color 140ms var(--ease);
-}
-
-.level:hover:not(:disabled),
-.level:focus-visible:not(:disabled) {
-  /* Auswahl invertiert auf Knochenweiss, wie im NieR-Menue und auf der Startseite. */
-  background: var(--bone);
-  color: var(--void);
-}
-
-.level:hover:not(:disabled) .lsub,
-.level:hover:not(:disabled) .lmeta,
-.level:hover:not(:disabled) .idx,
-.level:hover:not(:disabled) .state {
-  color: var(--void);
-}
-
-.level:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.idx {
+.record {
+  margin: 0;
   font-family: var(--mono);
   font-size: 0.72rem;
-  color: var(--bone-mute);
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--accent);
 }
 
-.body {
-  flex: 1;
+.lead {
+  margin: 0;
+  font-family: var(--body);
+  font-size: 0.95rem;
+  line-height: 1.6;
+  color: var(--bone-dim);
+  max-width: 34ch;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--s-3);
+  width: 100%;
+  margin: var(--s-1) 0;
+  padding: var(--s-3) 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.stats.three {
+  grid-template-columns: 1.4fr 1fr 1fr;
+}
+
+.stats div {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 4px;
   min-width: 0;
 }
 
-.ltitle {
-  font-family: var(--display);
-  font-size: 1.1rem;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-
-.lsub {
-  font-family: var(--body);
-  font-size: 0.8rem;
-  color: var(--bone-dim);
-}
-
-.lmeta {
+.stats dd {
+  margin: 0;
   font-family: var(--mono);
-  font-size: 0.62rem;
-  letter-spacing: 0.12em;
-  color: var(--bone-mute);
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--bone);
+  overflow-wrap: anywhere;
 }
 
-.state {
-  font-family: var(--mono);
-  font-size: 0.6rem;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--bone-mute);
-  white-space: nowrap;
-}
-
-/* --- Knoepfe ------------------------------------------------------------ */
-
-.go,
-.ghost {
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
   width: 100%;
-  padding: 0.8rem 1rem;
-  font-family: var(--mono);
-  font-size: 0.74rem;
+}
+
+.btn {
+  flex: 1 1 150px;
+  min-height: 48px;
+  padding: 0 18px;
+  font: 500 0.75rem/1 var(--mono);
   letter-spacing: 0.2em;
   text-transform: uppercase;
-  cursor: pointer;
+  color: var(--bone);
+  background: transparent;
   border: 1px solid var(--line-strong);
+  cursor: pointer;
+  transition:
+    background-color var(--fast) var(--ease),
+    color var(--fast) var(--ease),
+    border-color var(--fast) var(--ease);
 }
 
-.go {
+.btn.solid {
   background: var(--bone);
   color: var(--void);
   border-color: var(--bone);
 }
 
-.go:hover,
-.go:focus-visible {
-  background: #fff;
+.btn:hover,
+.btn:focus-visible {
+  background: var(--bone);
+  color: var(--void);
+  border-color: var(--bone);
 }
 
-.ghost {
-  margin-top: 6px;
+.btn.solid:hover,
+.btn.solid:focus-visible {
   background: transparent;
-  color: var(--bone-dim);
-}
-
-.ghost:hover,
-.ghost:focus-visible {
   color: var(--bone);
-  border-color: var(--bone-dim);
 }
 
-/* --- Aufklappbare Regeln ------------------------------------------------ */
-
-.how {
-  border-top: 1px solid var(--line);
-  padding-top: 0.8rem;
-  font-family: var(--body);
-  font-size: 0.84rem;
-  color: var(--bone-dim);
-}
-
-.how summary {
-  font-family: var(--mono);
-  font-size: 0.64rem;
-  letter-spacing: 0.18em;
+.link {
+  background: none;
+  border: 0;
+  padding: 6px;
+  font: 400 0.68rem/1 var(--mono);
+  letter-spacing: 0.2em;
   text-transform: uppercase;
   color: var(--bone-mute);
   cursor: pointer;
 }
 
-.how p {
-  margin: 0.7rem 0;
-  line-height: 1.6;
+.link:hover,
+.link:focus-visible {
+  color: var(--bone);
 }
 
-.how ul {
-  margin: 0.6rem 0;
-  padding-left: 1.1rem;
-  line-height: 1.7;
+.panel-enter-active {
+  animation: panelIn 420ms var(--ease) both;
+}
+.panel-leave-active {
+  animation: panelIn 180ms var(--ease) reverse both;
 }
 
-.orange {
-  color: var(--bullet-orange);
-}
-
-.purple {
-  color: var(--bullet-purple);
-}
-
-@media (max-width: 420px) {
-  .panel {
-    padding: 1.1rem 0.95rem;
+@keyframes panelIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
   }
-  .ltitle {
-    font-size: 1rem;
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .stats {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .stats.three {
+    grid-template-columns: 1fr 1fr;
+  }
+  .stats.three div:first-child {
+    grid-column: 1 / -1;
   }
 }
 </style>

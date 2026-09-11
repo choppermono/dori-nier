@@ -1,506 +1,729 @@
-import { TUNING, PALETTE } from './config.js'
-import { buildLevel, spawnEnemy } from './level.js'
+import { ARENA, PLAYER, TIMING, tierFor } from './config.js'
 import { LEVELS } from './levels.js'
+import {
+  TAU,
+  angleTo,
+  circleCircle,
+  circleRect,
+  clamp,
+  clampToArena,
+  dist,
+  distToSegment,
+  insideArena,
+  normalizeAngle,
+  pushOut,
+  rand,
+  rayLength,
+  turnTowards,
+} from './geom.js'
+import { event, queueSpawn, ring } from './patterns.js'
+import { applyWardens, damageEnemy, killEnemy, makeEnemy, updateEnemy } from './ai.js'
+import { BOSSES, damageBoss, destroyDecoy, makeBoss, runAttack, updateBoss } from './bosses.js'
+import { damagePlayer, healPlayer, segmentsLeft } from './combat.js'
 
-// Reine Spiellogik. Kein Vue, kein DOM, kein Canvas - diese Datei weiss nur, wie sich
-// der Zustand von einem Bild zum naechsten veraendert. Genau deshalb laesst sie sich
-// ohne Browser testen.
+// Pure game logic: no Vue, no DOM, no three.js. It only knows how the state
+// moves from one frame to the next, which is why it can be simulated without
+// a browser. The renderer and the sound read the state and the events this
+// file emits; they never change it.
+//
+// A sector runs through phases:
+//   intro -> waves (3) -> awaken (core breaks open) -> boss -> clear
+// and at any point -> dead when the last segment breaks.
 
-// ---------------------------------------------------------------------------
-// Geometrie
-// ---------------------------------------------------------------------------
+export { segmentsLeft }
+export const LEVEL_COUNT = LEVELS.length
 
-function circleRect(cx, cy, r, rect) {
-  const nx = Math.max(rect.x, Math.min(cx, rect.x + rect.w))
-  const ny = Math.max(rect.y, Math.min(cy, rect.y + rect.h))
-  const dx = cx - nx
-  const dy = cy - ny
-  return dx * dx + dy * dy <= r * r
-}
-
-function circleCircle(ax, ay, ar, bx, by, br) {
-  const dx = ax - bx
-  const dy = ay - by
-  const rr = ar + br
-  return dx * dx + dy * dy <= rr * rr
-}
-
-function pushOut(obj, r, rect) {
-  const nx = Math.max(rect.x, Math.min(obj.x, rect.x + rect.w))
-  const ny = Math.max(rect.y, Math.min(obj.y, rect.y + rect.h))
-  const dx = obj.x - nx
-  const dy = obj.y - ny
-  const distSq = dx * dx + dy * dy
-  if (distSq > r * r) return
-
-  if (distSq > 0.0001) {
-    const dist = Math.sqrt(distSq)
-    obj.x = nx + (dx / dist) * r
-    obj.y = ny + (dy / dist) * r
-    return
-  }
-
-  const left = Math.abs(obj.x - rect.x)
-  const right = Math.abs(rect.x + rect.w - obj.x)
-  const top = Math.abs(obj.y - rect.y)
-  const bottom = Math.abs(rect.y + rect.h - obj.y)
-  const min = Math.min(left, right, top, bottom)
-  if (min === left) obj.x = rect.x - r
-  else if (min === right) obj.x = rect.x + rect.w + r
-  else if (min === top) obj.y = rect.y - r
-  else obj.y = rect.y + rect.h + r
-}
-
-// Ein Gegner in einem Block ist unverwundbar: eigene Schuesse werden vom Block
-// verschluckt, bevor sie ihn erreichen. Deshalb wird beim Erscheinen herausgeschoben,
-// egal was die Leveldaten sagen. Die Daten sind zusaetzlich geprueft, aber diese
-// Absicherung haelt auch, wenn spaeter jemand ein Level danebensetzt.
-function nudgeOutOfBlocks(blocks, obj, r) {
-  // Etwas mehr als der Radius, damit der Gegner nicht exakt an der Kante klebt.
-  // Genau anliegend zaehlt je nach Rundung noch als Ueberschneidung.
-  const clear = r + 2
-  for (let pass = 0; pass < 4; pass++) {
-    let moved = false
-    for (const b of blocks) {
-      if (!b.alive) continue
-      const before = `${obj.x},${obj.y}`
-      pushOut(obj, clear, b)
-      if (`${obj.x},${obj.y}` !== before) moved = true
-    }
-    if (!moved) break
-  }
-}
-
-function normalizeAngle(a) {
-  while (a > Math.PI) a -= Math.PI * 2
-  while (a < -Math.PI) a += Math.PI * 2
-  return a
-}
-
-// Kuerzester Weg von einem Winkel zum anderen, damit die Drehung nicht den langen
-// Bogen nimmt, wenn sie ueber die Naht bei PI laeuft.
-function angleTowards(current, target, maxStep) {
-  const diff = normalizeAngle(target - current)
-  if (Math.abs(diff) <= maxStep) return target
-  return current + Math.sign(diff) * maxStep
-}
-
-// Wie weit kommt ein Strahl, bevor ihn ein Block aufhaelt? Schrittweise geprueft -
-// genau genug fuer die Darstellung und fuer den Treffertest, und billig.
-function rayLength(game, x, y, angle, maxLen) {
-  const step = 9
-  const cos = Math.cos(angle)
-  const sin = Math.sin(angle)
-  for (let t = 0; t < maxLen; t += step) {
-    const px = x + cos * t
-    const py = y + sin * t
-    if (px < 0 || py < 0 || px > game.width || py > game.height) return t
-    for (const b of game.blocks) {
-      if (b.alive && circleRect(px, py, 2, b)) return t
-    }
-  }
-  return maxLen
-}
-
-function distToSegment(px, py, ax, ay, bx, by) {
-  const dx = bx - ax
-  const dy = by - ay
-  const lenSq = dx * dx + dy * dy
-  let t = lenSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lenSq : 0
-  t = Math.max(0, Math.min(1, t))
-  return Math.hypot(px - (ax + dx * t), py - (ay + dy * t))
-}
-
-// ---------------------------------------------------------------------------
-// Spielerzustand
-// ---------------------------------------------------------------------------
-
-// Welches Segment liegt in Richtung eines Treffers? 0 vorne, 1 rechts, 2 hinten,
-// 3 links - jeweils relativ zur Blickrichtung, weil die Raute mitdreht.
-export function segmentFromDirection(worldAngle, playerAngle) {
-  const local = normalizeAngle(worldAngle - playerAngle)
-  const idx = Math.round(local / (Math.PI / 2))
-  return ((idx % 4) + 4) % 4
-}
-
-export function playerRadius(game) {
-  const lost = game.player.segments.filter((alive) => !alive).length
-  const factors = TUNING.player.radiusBySegmentsLost
-  const f = factors[Math.min(lost, factors.length - 1)]
-  return game.player.baseRadius * f
-}
-
-export function segmentsLeft(game) {
-  return game.player.segments.filter(Boolean).length
-}
-
-function damagePlayer(game, fromX, fromY) {
-  const p = game.player
-  if (p.invuln > 0) return
-
-  const worldAngle = Math.atan2(fromY - p.y, fromX - p.x)
-  let idx = segmentFromDirection(worldAngle, p.angle)
-
-  // Ist das Segment schon weg, bricht das naechstgelegene noch vorhandene.
-  if (!p.segments[idx]) {
-    const order = [1, -1, 2]
-    for (const off of order) {
-      const alt = (((idx + off) % 4) + 4) % 4
-      if (p.segments[alt]) {
-        idx = alt
-        break
-      }
-    }
-  }
-  if (!p.segments[idx]) return
-
-  p.segments[idx] = false
-  p.lastBrokenSegment = idx
-  p.breakFlash = 0.4
-  p.invuln = TUNING.player.invulnSeconds
-  p.radius = playerRadius(game)
-  game.shake = 0.3
-
-  if (segmentsLeft(game) === 0) {
-    game.status = 'lost'
-    game.lossReason = 'zerstoert'
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Aufbau
-// ---------------------------------------------------------------------------
-
-export function createGame(levelIndex, width, height) {
-  const def = LEVELS[Math.max(0, Math.min(levelIndex, LEVELS.length - 1))]
-  const built = buildLevel(def, width, height)
-  const cfg = TUNING.player
-  const baseRadius = cfg.radius * built.scale
+export function createGame(levelIndex, aspect = 1.6, opts = {}) {
+  const index = clamp(levelIndex | 0, 0, LEVELS.length - 1)
+  const def = LEVELS[index]
+  const portrait = aspect < 0.95
+  const { w: W, d: D } = portrait ? ARENA.portrait : ARENA.landscape
+  const toX = (fx) => (fx - 0.5) * W
+  const toY = (fy) => (fy - 0.5) * D
 
   const game = {
-    status: 'ready', // ready | running | levelclear | complete | lost
-    lossReason: '',
-    levelIndex,
-    levelName: built.name,
-    levelSubtitle: built.subtitle,
-    width,
-    height,
-    scale: built.scale,
-    timeLimit: def.timeLimit,
-    timeLeft: def.timeLimit,
-    shake: 0,
-
+    levelIndex: index,
+    def,
+    theme: def.theme,
+    W,
+    D,
+    portrait,
+    status: 'running', // running | won | lost
+    phase: opts.preview ? 'preview' : 'intro',
+    phaseT: 0,
+    time: 0,
+    clock: 0,
+    tier: tierFor(index),
     player: {
-      x: width / 2,
-      y: height * 0.86,
+      x: 0,
+      y: D * 0.34,
       angle: -Math.PI / 2,
-      baseRadius,
-      radius: baseRadius,
+      r: PLAYER.radius,
       segments: [true, true, true, true],
-      lastBrokenSegment: -1,
-      breakFlash: 0,
       invuln: 0,
-      fireCooldown: 0,
+      fireCd: 0.2,
       firing: false,
+      muzzle: 0,
+      vx: 0,
+      vy: 0,
+      alive: true,
     },
-
+    shots: [],
     bullets: [],
-    enemyBullets: [],
     enemies: [],
-    pendingSpawns: [],
-    sparks: [],
-
-    blocks: built.blocks,
-    cores: built.cores,
-    waves: built.waves,
-    coreFiresDuringWaves: built.coreFiresDuringWaves,
+    spawns: [],
+    hazards: [],
+    timers: [],
+    blocks: [],
+    core: null,
+    boss: null,
     waveIndex: -1,
-    waveGap: 0,
-    wavesDone: false,
+    waveCount: def.waves.length,
+    waveDelay: TIMING.wavePause,
+    clearedWave: -1,
+    events: [],
+    shake: 0,
+    slow: 0,
+    pull: null,
+    stats: { kills: 0, damage: 0, shots: 0 },
+    nextId: 1,
+    reduced: !!opts.reduced,
+    god: !!opts.god,
+    toX,
+    toY,
   }
 
-  startWave(game, 0)
+  game.blocks = def.blocks.map((b) => makeBlock(game, b))
+  game.core = {
+    x: toX(def.core.fx),
+    y: toY(def.core.fy),
+    r: 0.85,
+    alive: true,
+    shielded: true,
+    broken: false,
+    shields: def.waves.length,
+    spin: 0,
+    flash: 0,
+    angle: Math.PI / 2,
+    cd: 2,
+    fire: def.coreFire || null,
+    state: {},
+  }
   return game
 }
 
-function startWave(game, index) {
-  game.waveIndex = index
-  const wave = game.waves[index]
-  if (!wave) {
-    game.wavesDone = true
-    return
-  }
-  for (const spec of wave) {
-    // Markierung schon an der bereinigten Stelle zeigen, damit sie nicht woanders
-    // steht als der Gegner, der gleich erscheint.
-    const spot = { x: spec.x, y: spec.y }
-    nudgeOutOfBlocks(game.blocks, spot, spec.radius)
-    game.pendingSpawns.push({
-      spec,
-      x: spot.x,
-      y: spot.y,
-      radius: spec.radius,
-      timer: TUNING.wave.spawnWarnSeconds,
-    })
+function makeBlock(game, b) {
+  const crate = b.kind === 'crate'
+  const cx = game.toX(b.fx)
+  const cy = game.toY(b.fy)
+  return {
+    id: game.nextId++,
+    x: cx - b.w / 2,
+    y: cy - b.h / 2,
+    w: b.w,
+    h: b.h,
+    cx,
+    cy,
+    kind: crate ? 'crate' : 'cover',
+    hp: crate ? 4 : Infinity,
+    maxHp: crate ? 4 : Infinity,
+    alive: true,
+    flash: 0,
+    temp: false,
+    life: 0,
   }
 }
 
-export function isShielded(game) {
-  return !game.wavesDone
+// The caller reads the events after each update and hands them to the
+// renderer and the sound, exactly once.
+export function drainEvents(game) {
+  const list = game.events
+  game.events = []
+  return list
 }
 
 export function enemiesLeft(game) {
-  return game.enemies.length + game.pendingSpawns.length
+  return game.enemies.length + game.spawns.length
 }
 
-export function waveLabel(game) {
-  return `${Math.min(game.waveIndex + 1, game.waves.length)} / ${game.waves.length}`
+function setPhase(game, phase) {
+  game.phase = phase
+  game.phaseT = 0
 }
 
 // ---------------------------------------------------------------------------
-// Groessenaenderung
+// Main loop
 // ---------------------------------------------------------------------------
 
-export function resize(game, width, height) {
-  if (width < 2 || height < 2) return
-  const fx = width / game.width
-  const fy = height / game.height
-  if (Math.abs(fx - 1) < 0.001 && Math.abs(fy - 1) < 0.001) return
-  const f = Math.min(fx, fy)
+export function update(game, rawDt, input) {
+  if (game.status !== 'running' || game.phase === 'preview') return
 
-  const move = (o) => {
-    o.x *= fx
-    o.y *= fy
+  const slowK = game.slow > 0 ? 0.28 : 1
+  if (game.slow > 0) game.slow -= rawDt
+  // Capped: after a stall, bullets must not tunnel through the player.
+  const dt = Math.min(rawDt, 0.05) * slowK
+  game.phaseT += dt
+  game.clock += dt
+  if (game.phase === 'waves' || game.phase === 'awaken' || game.phase === 'boss') game.time += dt
+  game.shake = Math.max(0, game.shake - rawDt * 1.5)
+
+  runTimers(game, dt)
+
+  switch (game.phase) {
+    case 'intro':
+      if (game.phaseT >= TIMING.intro) {
+        setPhase(game, 'waves')
+        startWave(game, 0)
+      }
+      break
+    case 'waves':
+      updateWaves(game, dt)
+      break
+    case 'awaken':
+      updateAwaken(game)
+      break
+    case 'clear':
+      if (game.phaseT >= TIMING.clearDelay) {
+        game.status = 'won'
+        event(game, 'levelClear')
+      }
+      break
+    case 'dead':
+      if (game.phaseT >= TIMING.deathDelay) {
+        game.status = 'lost'
+        event(game, 'levelLost')
+      }
+      break
   }
 
-  move(game.player)
-  game.player.baseRadius *= f
-  game.player.radius = playerRadius(game)
+  updatePlayer(game, dt, input)
+  updateSpawns(game, dt)
+  applyWardens(game)
+  for (const e of game.enemies) if (e.alive) updateEnemy(game, e, dt)
+  if (game.boss) updateBoss(game, game.boss, dt)
+  updateCore(game, dt)
+  separate(game)
+  updateShots(game, dt)
+  updateBullets(game, dt)
+  updateHazards(game, dt)
+  updateBlocks(game, dt)
 
-  for (const b of game.bullets.concat(game.enemyBullets)) {
-    move(b)
-    b.vx *= fx
-    b.vy *= fy
-    b.radius *= f
-  }
-  for (const b of game.blocks) {
-    b.x *= fx
-    b.y *= fy
-    b.w *= fx
-    b.h *= fy
-  }
-  for (const c of game.cores) {
-    move(c)
-    c.radius *= f
-  }
-  for (const e of game.enemies) {
-    move(e)
-    e.radius *= f
-    e.speed *= f
-    e.chargeSpeed *= f
-    e.standoff *= f
-    e.orbitRadius *= f
-  }
-  for (const s of game.pendingSpawns) {
-    move(s)
-    s.radius *= f
-  }
-  for (const wave of game.waves) {
-    for (const spec of wave) {
-      spec.x *= fx
-      spec.y *= fy
-      spec.radius *= f
-      spec.speed *= f
-      spec.chargeSpeed *= f
-      spec.standoff *= f
-      spec.orbitRadius *= f
+  if (game.enemies.some((e) => !e.alive)) game.enemies = game.enemies.filter((e) => e.alive)
+  if (game.phase === 'boss' && game.boss && !game.boss.alive) bossDefeated(game)
+}
+
+function runTimers(game, dt) {
+  const list = game.timers
+  for (let i = list.length - 1; i >= 0; i--) {
+    const t = list[i]
+    t.t -= dt
+    if (t.t <= 0) {
+      list.splice(i, 1)
+      t.fn(game)
     }
   }
-  for (const s of game.sparks) move(s)
-
-  game.scale *= f
-  game.width = width
-  game.height = height
 }
 
 // ---------------------------------------------------------------------------
-// Effekte
+// Waves, awakening, boss
 // ---------------------------------------------------------------------------
 
-function burst(game, x, y, color, count = 8) {
-  for (let i = 0; i < count; i++) {
-    const a = Math.random() * Math.PI * 2
-    const sp = (60 + Math.random() * 150) * game.scale
-    game.sparks.push({
-      x,
-      y,
-      vx: Math.cos(a) * sp,
-      vy: Math.sin(a) * sp,
-      life: 0.35 + Math.random() * 0.25,
-      maxLife: 0.6,
-      color,
-    })
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Feuermuster
-// ---------------------------------------------------------------------------
-
-function pushBullet(game, x, y, angle, speed, kind, homing) {
-  game.enemyBullets.push({
-    x,
-    y,
-    vx: Math.cos(angle) * speed * game.scale,
-    vy: Math.sin(angle) * speed * game.scale,
-    radius: TUNING.bullet.radius * game.scale,
-    kind,
-    homing: !!homing,
-    life: homing ? TUNING.bullet.homingLifetime : 0,
+function startWave(game, index) {
+  game.waveIndex = index
+  game.waveDelay = TIMING.wavePause
+  const wave = game.def.waves[index] || []
+  wave.forEach((spec, si) => {
+    const count = spec.count || 1
+    const cx = game.toX(spec.fx)
+    const cy = game.toY(spec.fy)
+    for (let i = 0; i < count; i++) {
+      let x = cx
+      let y = cy
+      if (count > 1) {
+        const a = (i / count) * TAU
+        x += Math.cos(a) * 0.85
+        y += Math.sin(a) * 0.85
+      }
+      queueSpawn(game, spec.type, x, y, si * TIMING.spawnStagger + i * 0.05, {
+        pattern: spec.pattern,
+        armored: spec.armored,
+        orbit: spec.orbit,
+      })
+    }
   })
+  event(game, 'wave', { index, total: game.waveCount })
 }
 
-function fire(game, e, aimAngle) {
-  const p = e.pattern
-  const originX = e.x + Math.cos(aimAngle) * e.radius
-  const originY = e.y + Math.sin(aimAngle) * e.radius
+function updateWaves(game, dt) {
+  const busy = game.spawns.length > 0 || game.enemies.some((e) => e.alive)
+  if (busy) {
+    game.waveDelay = TIMING.wavePause
+    return
+  }
+  if (game.clearedWave < game.waveIndex) {
+    game.clearedWave = game.waveIndex
+    game.core.shields = Math.max(0, game.waveCount - game.waveIndex - 1)
+    event(game, 'waveClear', { index: game.waveIndex, total: game.waveCount })
+  }
+  game.waveDelay -= dt
+  if (game.waveDelay > 0) return
+  if (game.waveIndex >= game.waveCount - 1) beginAwaken(game)
+  else startWave(game, game.waveIndex + 1)
+}
 
-  switch (e.patternName) {
-    case 'single':
-      pushBullet(game, originX, originY, aimAngle, p.speed, p.kind)
-      break
+function beginAwaken(game) {
+  setPhase(game, 'awaken')
+  dissolveBullets(game)
+  game.hazards.length = 0
+  healPlayer(game)
+  const def = BOSSES[game.def.boss]
+  event(game, 'awaken', { name: def.name, title: def.title, x: game.core.x, y: game.core.y })
+}
 
-    case 'spread': {
-      const half = p.arc / 2
-      for (let i = 0; i < p.count; i++) {
-        const t = p.count === 1 ? 0.5 : i / (p.count - 1)
-        pushBullet(game, originX, originY, aimAngle - half + p.arc * t, p.speed, p.kind)
-      }
-      break
+function updateAwaken(game) {
+  const c = game.core
+  if (!c.broken && game.phaseT >= 0.6) {
+    c.broken = true
+    c.shielded = false
+    game.shake = Math.max(game.shake, 0.55)
+    event(game, 'shieldBreak', { x: c.x, y: c.y })
+  }
+  if (game.phaseT >= TIMING.awaken) {
+    c.alive = false
+    game.boss = makeBoss(game, game.def.boss)
+    setPhase(game, 'boss')
+    event(game, 'bossSpawn', { x: c.x, y: c.y, id: game.def.boss })
+  }
+}
+
+function bossDefeated(game) {
+  setPhase(game, 'clear')
+  dissolveBullets(game)
+  game.hazards.length = 0
+  game.spawns.length = 0
+  for (const e of game.enemies) if (e.alive) killEnemy(game, e, true)
+  game.enemies = []
+  game.pull = null
+  game.shake = 1
+  if (!game.reduced) game.slow = 0.9
+}
+
+function dissolveBullets(game) {
+  const pts = []
+  for (let i = 0; i < game.bullets.length && pts.length < 600; i += 2) {
+    const b = game.bullets[i]
+    pts.push(b.x, b.y, b.kind === 'hot' ? 1 : 0)
+  }
+  if (pts.length) event(game, 'dissolve', { pts })
+  game.bullets.length = 0
+  game.timers.length = 0
+}
+
+function updateSpawns(game, dt) {
+  for (let i = game.spawns.length - 1; i >= 0; i--) {
+    const s = game.spawns[i]
+    s.t -= dt
+    if (!s.warned && s.t <= s.warn) {
+      s.warned = true
+      event(game, 'spawnWarn', { x: s.x, y: s.y, type: s.type })
     }
+    if (s.t <= 0) {
+      const e = makeEnemy(game, s.type, s.x, s.y, s.opts)
+      game.enemies.push(e)
+      game.spawns.splice(i, 1)
+      event(game, 'spawn', { x: e.x, y: e.y, type: e.type, id: e.id })
+    }
+  }
+}
 
-    case 'burst':
-      // Erster Schuss sofort, die restlichen ueber burstLeft nachgereicht.
-      pushBullet(game, originX, originY, aimAngle, p.speed, p.kind)
-      e.burstLeft = p.shots - 1
-      e.burstTimer = p.gap
-      break
-
-    case 'ring':
-      for (let i = 0; i < p.count; i++) {
-        const a = (i / p.count) * Math.PI * 2
-        pushBullet(game, e.x + Math.cos(a) * e.radius, e.y + Math.sin(a) * e.radius, a, p.speed, p.kind)
-      }
-      break
-
-    case 'homing':
-      pushBullet(game, originX, originY, aimAngle, p.speed, p.kind, true)
-      break
-
-    case 'beam':
-      // Erst ankuendigen, dann treffen. Ohne Vorwarnung waere es ein Hinterhalt.
-      e.beamWarn = TUNING.beam.warnSeconds
-      e.beamAngle = aimAngle
-      break
-
-    default:
-      break
+function updateCore(game, dt) {
+  const c = game.core
+  if (!c.alive) return
+  c.spin += dt * (c.shielded ? 0.8 : 2.4)
+  if (c.flash > 0) c.flash -= dt
+  if (game.phase === 'waves' && c.fire) {
+    c.cd -= dt
+    if (c.cd <= 0) {
+      c.cd = c.fire.every * game.tier.rate
+      runAttack(game, c, c.fire)
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Gegnerbewegung
+// Player
 // ---------------------------------------------------------------------------
 
-function steerHunter(e, game, dt) {
-  const p = game.player
-  const dx = p.x - e.x
-  const dy = p.y - e.y
-  const dist = Math.hypot(dx, dy) || 1
-
-  // Wunschabstand: naeher kommen wenn zu weit, zurueckweichen wenn zu nah.
-  // Ein Jaeger, der stumpf hineinrennt, klebt am Spieler und nimmt ihm jede
-  // Ausweichmoeglichkeit.
-  const diff = dist - e.standoff
-  const dir = Math.abs(diff) < e.radius ? 0 : Math.sign(diff)
-  e.x += (dx / dist) * dir * e.speed * dt
-  e.y += (dy / dist) * dir * e.speed * dt
+function solidPush(p, x, y, r) {
+  const dx = p.x - x
+  const dy = p.y - y
+  const min = p.r + r
+  const d = Math.hypot(dx, dy)
+  if (d >= min) return
+  if (d < 1e-4) {
+    p.y = y + min
+    return
+  }
+  p.x = x + (dx / d) * min
+  p.y = y + (dy / d) * min
 }
 
-function steerCharger(e, game, dt) {
+function updatePlayer(game, dt, input) {
   const p = game.player
-  e.chargeTimer -= dt
+  if (!p.alive) {
+    p.vx = 0
+    p.vy = 0
+    return
+  }
 
-  switch (e.chargeState) {
-    case 'idle': {
-      const dx = p.x - e.x
-      const dy = p.y - e.y
-      const dist = Math.hypot(dx, dy) || 1
-      e.x += (dx / dist) * e.speed * dt
-      e.y += (dy / dist) * e.speed * dt
-      if (e.chargeTimer <= 0) {
-        e.chargeState = 'windup'
-        e.chargeTimer = 0.85
-        e.chargeDx = dx / dist
-        e.chargeDy = dy / dist
-      }
-      break
-    }
-    case 'windup': {
-      // Richtung ist gesperrt und wird angezeigt. Ausgewichen wird seitlich.
-      if (e.chargeTimer <= 0) {
-        e.chargeState = 'charging'
-        e.chargeTimer = 0.85
-      }
-      break
-    }
-    case 'charging': {
-      e.x += e.chargeDx * e.chargeSpeed * dt
-      e.y += e.chargeDy * e.chargeSpeed * dt
-      if (e.chargeTimer <= 0) {
-        e.chargeState = 'recover'
-        e.chargeTimer = 1.6
-      }
-      break
-    }
-    default: {
-      if (e.chargeTimer <= 0) {
-        e.chargeState = 'idle'
-        e.chargeTimer = 1.2 + Math.random()
-      }
-      break
+  // Left stick: letting go means standing still. No inertia, no dodge roll -
+  // movement is the dodge.
+  const mv = input?.move || { x: 0, y: 0 }
+  const len = Math.hypot(mv.x, mv.y)
+  let vx = 0
+  let vy = 0
+  if (len > 0.01) {
+    const throttle = Math.min(1, len)
+    vx = (mv.x / len) * PLAYER.speed * throttle
+    vy = (mv.y / len) * PLAYER.speed * throttle
+  }
+  if (game.pull) {
+    const a = angleTo(p.x, p.y, game.pull.x, game.pull.y)
+    vx += Math.cos(a) * game.pull.k
+    vy += Math.sin(a) * game.pull.k
+  }
+  p.vx = vx
+  p.vy = vy
+  p.x += vx * dt
+  p.y += vy * dt
+
+  clampToArena(game, p, p.r)
+  for (const b of game.blocks) if (b.alive) pushOut(p, p.r, b)
+  for (const e of game.enemies) if (e.alive && e.solid && !e.phased) solidPush(p, e.x, e.y, e.r)
+  if (game.core.alive) solidPush(p, game.core.x, game.core.y, game.core.r)
+  const B = game.boss
+  if (B && B.alive && !B.phased) solidPush(p, B.x, B.y, B.r * 0.85)
+  clampToArena(game, p, p.r)
+
+  // Right stick turns and fires at once. Let go and the angle stays put.
+  const aim = input?.aim || { x: 0, y: 0, active: false }
+  const aimLen = Math.hypot(aim.x, aim.y)
+  p.firing = !!aim.active && aimLen > 0.2
+  if (p.firing) p.angle = turnTowards(p.angle, Math.atan2(aim.y, aim.x), PLAYER.turnRate * dt)
+
+  const canFire = game.phase === 'waves' || game.phase === 'boss' || game.phase === 'awaken'
+  p.fireCd -= dt
+  if (p.firing && canFire && p.fireCd <= 0) {
+    p.fireCd = PLAYER.fireInterval
+    p.muzzle = p.muzzle ? 0 : 1
+    const side = p.muzzle ? 1 : -1
+    const fx = Math.cos(p.angle)
+    const fy = Math.sin(p.angle)
+    game.shots.push({
+      x: p.x + fx * p.r * 1.3 - fy * 0.13 * side,
+      y: p.y + fy * p.r * 1.3 + fx * 0.13 * side,
+      vx: fx * PLAYER.shotSpeed,
+      vy: fy * PLAYER.shotSpeed,
+      r: PLAYER.shotRadius,
+      life: PLAYER.shotLife,
+    })
+    game.stats.shots += 1
+    event(game, 'shot', { x: p.x, y: p.y })
+  }
+
+  if (p.invuln > 0) p.invuln -= dt
+}
+
+// ---------------------------------------------------------------------------
+// Player shots
+// ---------------------------------------------------------------------------
+
+function updateShots(game, dt) {
+  const shots = game.shots
+  for (let i = shots.length - 1; i >= 0; i--) {
+    const s = shots[i]
+    s.x += s.vx * dt
+    s.y += s.vy * dt
+    s.life -= dt
+    if (s.life <= 0 || !insideArena(game, s.x, s.y, 0.3) || hitShot(game, s)) {
+      shots[i] = shots[shots.length - 1]
+      shots.pop()
     }
   }
 }
 
-function steerOrbiter(e, game, dt) {
-  const target = game.cores.find((c) => c.alive) || {
-    x: game.width / 2,
-    y: game.height / 2,
+// The order matters: orange bullets first (shooting them down is the point),
+// then mines, blocks, enemies, the boss, the core. Returns true if consumed.
+function hitShot(game, s) {
+  const bullets = game.bullets
+  for (let j = bullets.length - 1; j >= 0; j--) {
+    const b = bullets[j]
+    if (b.kind !== 'hot') continue
+    if (circleCircle(s.x, s.y, s.r, b.x, b.y, b.r)) {
+      bullets[j] = bullets[bullets.length - 1]
+      bullets.pop()
+      event(game, 'pop', { x: b.x, y: b.y })
+      return true
+    }
   }
-  const r = e.orbitRadius || Math.min(game.width, game.height) * 0.22
-  e.orbitAngle += (e.speed / Math.max(r, 1)) * dt
-  e.x = target.x + Math.cos(e.orbitAngle) * r
-  e.y = target.y + Math.sin(e.orbitAngle) * r
+
+  for (const h of game.hazards) {
+    if (h.type === 'mine' && !h.dead && circleCircle(s.x, s.y, s.r, h.x, h.y, h.r + 0.06)) {
+      h.dead = true
+      event(game, 'mineShot', { x: h.x, y: h.y })
+      return true
+    }
+  }
+
+  for (const b of game.blocks) {
+    if (!b.alive || !circleRect(s.x, s.y, s.r, b)) continue
+    if (b.kind === 'crate') {
+      b.hp -= 1
+      b.flash = 0.1
+      if (b.hp <= 0) breakBlock(game, b, false)
+      else event(game, 'blockHit', { x: s.x, y: s.y })
+    } else {
+      event(game, 'spark', { x: s.x, y: s.y })
+    }
+    return true
+  }
+
+  // The impact point is taken a little behind the shot, so the armour check
+  // sees which side it came from.
+  const ix = s.x - s.vx * 0.012
+  const iy = s.y - s.vy * 0.012
+
+  for (const e of game.enemies) {
+    if (!e.alive || e.phased) continue
+    if (circleCircle(s.x, s.y, s.r, e.x, e.y, e.r)) {
+      damageEnemy(game, e, 1, ix, iy)
+      return true
+    }
+  }
+
+  const B = game.boss
+  if (B && B.alive && !B.phased) {
+    for (const part of B.parts) {
+      if (!part.alive || part.phased) continue
+      if (circleCircle(s.x, s.y, s.r, part.x, part.y, part.r)) {
+        if (part.decoy) destroyDecoy(game, B, part)
+        else event(game, 'deflect', { x: s.x, y: s.y })
+        return true
+      }
+    }
+    if (circleCircle(s.x, s.y, s.r, B.x, B.y, B.r)) {
+      damageBoss(game, B, 1, ix, iy)
+      return true
+    }
+  }
+
+  const c = game.core
+  if (c.alive && circleCircle(s.x, s.y, s.r, c.x, c.y, c.r * 1.25)) {
+    c.flash = 0.08
+    event(game, 'shieldHit', { x: s.x, y: s.y })
+    return true
+  }
+  return false
 }
 
-// Mehrere Verfolger mit demselben Ziel sammeln sich sonst auf einem Punkt und
-// werden zu einem einzigen dicken Gegner.
+function breakBlock(game, b, expired) {
+  b.alive = false
+  event(game, 'blockBreak', { x: b.cx, y: b.cy, w: b.w, h: b.h, id: b.id, temp: b.temp })
+  // An ice pillar that runs out of time shatters into shards; one you shoot
+  // apart first does not.
+  if (expired && b.shatter) ring(game, b.cx, b.cy, b.shatter, 3.2, 'cold', rand(0, TAU), 0.5)
+}
+
+function updateBlocks(game, dt) {
+  let prune = false
+  for (const b of game.blocks) {
+    if (b.flash > 0) b.flash -= dt
+    if (b.temp && b.alive) {
+      b.life -= dt
+      if (b.life <= 0) breakBlock(game, b, true)
+    }
+    if (b.temp && !b.alive) prune = true
+  }
+  if (prune) game.blocks = game.blocks.filter((b) => b.alive || !b.temp)
+}
+
+// ---------------------------------------------------------------------------
+// Enemy bullets
+// ---------------------------------------------------------------------------
+
+function updateBullets(game, dt) {
+  const p = game.player
+  const list = game.bullets
+  for (let i = list.length - 1; i >= 0; i--) {
+    const b = list[i]
+    b.age += dt
+    let remove = b.life > 0 && b.age >= b.life
+
+    if (!remove) {
+      if (b.homingT > 0) {
+        b.homingT -= dt
+        b.a = turnTowards(b.a, angleTo(b.x, b.y, p.x, p.y), b.homing * dt)
+      }
+      if (b.curve) b.a += b.curve * dt
+      if (b.accel) b.s = clamp(b.s + b.accel * dt, b.minS, b.maxS)
+      b.x += Math.cos(b.a) * b.s * dt
+      b.y += Math.sin(b.a) * b.s * dt
+      remove = !insideArena(game, b.x, b.y, 0.6)
+    }
+
+    if (!remove) {
+      for (const bl of game.blocks) {
+        if (bl.alive && circleRect(b.x, b.y, b.r * 0.8, bl)) {
+          remove = true
+          break
+        }
+      }
+    }
+
+    // While invulnerable, bullets pass through instead of being eaten.
+    if (!remove && p.alive && circleCircle(b.x, b.y, b.r, p.x, p.y, p.r)) {
+      remove = damagePlayer(game, b.x, b.y)
+    }
+
+    if (remove) {
+      list[i] = list[list.length - 1]
+      list.pop()
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hazards: beams, mortar shells, mines, shockwaves
+// ---------------------------------------------------------------------------
+
+function updateHazards(game, dt) {
+  const list = game.hazards
+  for (let i = list.length - 1; i >= 0; i--) {
+    const h = list[i]
+    let done = false
+    if (h.type === 'beam') done = updateBeam(game, h, dt)
+    else if (h.type === 'mortar') done = updateMortar(game, h, dt)
+    else if (h.type === 'mine') done = updateMine(game, h, dt)
+    else if (h.type === 'shock') done = updateShock(game, h, dt)
+    if (done) list.splice(i, 1)
+  }
+}
+
+function beamLength(game, h) {
+  const maxLen = Math.hypot(game.W, game.D)
+  const ox = h.x + Math.cos(h.a) * h.offset
+  const oy = h.y + Math.sin(h.a) * h.offset
+  return h.offset + rayLength(game, ox, oy, h.a, maxLen, h.pierce)
+}
+
+function updateBeam(game, h, dt) {
+  if (h.owner) {
+    if (h.owner.alive === false) return true
+    h.x = h.owner.x
+    h.y = h.owner.y
+  }
+  if (h.warn > 0) {
+    h.warn -= dt
+    h.len = beamLength(game, h)
+    if (h.warn <= 0) event(game, 'beamFire', { x: h.x, y: h.y, line: !!h.line })
+    return false
+  }
+  h.active -= dt
+  if (h.spin) h.a += h.spin * dt
+  h.len = beamLength(game, h)
+  if (h.active <= 0) return true
+
+  const p = game.player
+  if (!p.alive) return false
+  const ox = h.x + Math.cos(h.a) * h.offset
+  const oy = h.y + Math.sin(h.a) * h.offset
+  const ex = h.x + Math.cos(h.a) * h.len
+  const ey = h.y + Math.sin(h.a) * h.len
+  if (distToSegment(p.x, p.y, ox, oy, ex, ey) < h.width / 2 + p.r) {
+    // Take the hit from the nearest point on the beam, so the right side breaks.
+    const dx = ex - ox
+    const dy = ey - oy
+    const l2 = dx * dx + dy * dy || 1
+    const t = clamp(((p.x - ox) * dx + (p.y - oy) * dy) / l2, 0, 1)
+    const nx = ox + dx * t
+    const ny = oy + dy * t
+    const away = dist(p.x, p.y, nx, ny) < 0.01
+    damagePlayer(game, away ? ox : nx, away ? oy : ny)
+  }
+  return false
+}
+
+function updateMortar(game, h, dt) {
+  h.t += dt
+  if (h.t < h.flight) return false
+  const p = game.player
+  if (p.alive && dist(p.x, p.y, h.x, h.y) < h.blast + p.r * 0.5) damagePlayer(game, h.x, h.y)
+  if (h.n) ring(game, h.x, h.y, h.n, 3.2, 'hot', rand(0, TAU), 0.2)
+  game.shake = Math.max(game.shake, 0.22)
+  event(game, 'boom', { x: h.x, y: h.y, r: h.blast })
+  return true
+}
+
+function updateMine(game, h, dt) {
+  if (h.dead) return true
+  h.fuse -= dt
+  const p = game.player
+  if (p.alive && circleCircle(p.x, p.y, p.r, h.x, h.y, h.r)) {
+    damagePlayer(game, h.x, h.y)
+    explodeMine(game, h)
+    return true
+  }
+  if (h.fuse <= 0) {
+    explodeMine(game, h)
+    return true
+  }
+  return false
+}
+
+function explodeMine(game, h) {
+  ring(game, h.x, h.y, h.n, 3.4, 'mix', rand(0, TAU), 0.2)
+  event(game, 'boom', { x: h.x, y: h.y, r: 0.7, small: true })
+}
+
+function updateShock(game, h, dt) {
+  h.r += h.speed * dt
+  const p = game.player
+  if (!h.hit && p.alive) {
+    const d = dist(p.x, p.y, h.x, h.y)
+    if (Math.abs(d - h.r) < h.width / 2 + p.r) {
+      const a = angleTo(h.x, h.y, p.x, p.y)
+      // The ship must fit through the gap, not just its centre.
+      const margin = p.r / Math.max(d, 0.5)
+      const inGap = h.gaps.some((g) => Math.abs(normalizeAngle(a - g)) < h.gapW / 2 - margin)
+      const covered = rayLength(game, h.x, h.y, a, d) < d - p.r
+      if (!inGap && !covered && damagePlayer(game, h.x, h.y)) h.hit = true
+    }
+  }
+  return h.r >= h.maxR
+}
+
+// ---------------------------------------------------------------------------
+// Crowd control
+// ---------------------------------------------------------------------------
+
+// Several chasers with the same target would otherwise merge into one blob.
 function separate(game) {
-  const movers = game.enemies.filter((e) => e.alive && !e.solid)
-  for (let i = 0; i < movers.length; i++) {
-    for (let j = i + 1; j < movers.length; j++) {
-      const a = movers[i]
-      const b = movers[j]
+  const list = game.enemies
+  for (let i = 0; i < list.length; i++) {
+    const a = list[i]
+    if (!a.alive || a.solid || a.phased) continue
+    for (let j = i + 1; j < list.length; j++) {
+      const b = list[j]
+      if (!b.alive || b.solid || b.phased) continue
       const dx = b.x - a.x
       const dy = b.y - a.y
-      const min = a.radius + b.radius + 6
-      const distSq = dx * dx + dy * dy
-      if (distSq >= min * min || distSq < 0.0001) continue
-      const dist = Math.sqrt(distSq)
-      const push = (min - dist) / 2
-      const nx = dx / dist
-      const ny = dy / dist
+      const min = a.r + b.r + 0.1
+      const d2 = dx * dx + dy * dy
+      if (d2 >= min * min || d2 < 1e-8) continue
+      const d = Math.sqrt(d2)
+      const push = (min - d) / 2
+      const nx = dx / d
+      const ny = dy / d
       a.x -= nx * push
       a.y -= ny * push
       b.x += nx * push
@@ -510,379 +733,19 @@ function separate(game) {
 }
 
 // ---------------------------------------------------------------------------
-// Hauptschleife
+// Debug helpers (used by the dev tools and the balance simulation)
 // ---------------------------------------------------------------------------
 
-export function update(game, dt, input) {
-  if (game.status !== 'running') return
-
-  game.shake = Math.max(0, game.shake - dt)
-
-  game.timeLeft -= dt
-  if (game.timeLeft <= 0) {
-    game.timeLeft = 0
-    game.status = 'lost'
-    game.lossReason = 'zeit'
-    return
-  }
-
-  updatePlayer(game, dt, input)
-  updateWaves(game, dt)
-  updateEnemies(game, dt)
-  updateCores(game, dt)
-  updatePlayerBullets(game, dt)
-  updateEnemyBullets(game, dt)
-  updateSparks(game, dt)
-
-  if (game.status === 'running' && game.wavesDone && game.cores.every((c) => !c.alive)) {
-    game.status = 'levelclear'
-  }
+export function debugClearWave(game) {
+  for (const e of game.enemies) if (e.alive) killEnemy(game, e, true)
+  game.enemies = []
+  game.spawns.length = 0
 }
 
-function updatePlayer(game, dt, input) {
-  const p = game.player
-  const cfg = TUNING.player
-  const s = game.scale
-
-  // Linker Stick: Loslassen heisst Stillstand. Keine Traegheit, kein Ausweichmanoever.
-  const moveLen = Math.hypot(input.move.x, input.move.y)
-  if (moveLen > 0.001) {
-    const throttle = Math.min(1, moveLen)
-    p.x += (input.move.x / moveLen) * cfg.speed * s * throttle * dt
-    p.y += (input.move.y / moveLen) * cfg.speed * s * throttle * dt
-  }
-
-  p.x = Math.max(p.radius, Math.min(game.width - p.radius, p.x))
-  p.y = Math.max(p.radius, Math.min(game.height - p.radius, p.y))
-
-  for (const b of game.blocks) if (b.alive) pushOut(p, p.radius, b)
-  for (const e of game.enemies) {
-    if (!e.alive || !e.solid) continue
-    const dx = p.x - e.x
-    const dy = p.y - e.y
-    const min = p.radius + e.radius
-    const dist = Math.hypot(dx, dy)
-    if (dist < min && dist > 0.001) {
-      p.x = e.x + (dx / dist) * min
-      p.y = e.y + (dy / dist) * min
-    }
-  }
-
-  // Rechter Stick: Drehung und Feuer zugleich. Losgelassen bleibt der Winkel stehen.
-  const aimLen = Math.hypot(input.aim.x, input.aim.y)
-  p.firing = input.aim.active && aimLen > 0.15
-  if (p.firing) {
-    p.angle = angleTowards(p.angle, Math.atan2(input.aim.y, input.aim.x), cfg.turnRate * dt)
-  }
-
-  p.fireCooldown -= dt
-  if (p.firing && p.fireCooldown <= 0) {
-    p.fireCooldown = cfg.fireInterval
-    game.bullets.push({
-      x: p.x + Math.cos(p.angle) * p.radius,
-      y: p.y + Math.sin(p.angle) * p.radius,
-      vx: Math.cos(p.angle) * cfg.bulletSpeed * s,
-      vy: Math.sin(p.angle) * cfg.bulletSpeed * s,
-      radius: cfg.bulletRadius * s,
-    })
-  }
-
-  if (p.invuln > 0) p.invuln -= dt
-  if (p.breakFlash > 0) p.breakFlash -= dt
-}
-
-function updateWaves(game, dt) {
-  for (let i = game.pendingSpawns.length - 1; i >= 0; i--) {
-    const sp = game.pendingSpawns[i]
-    sp.timer -= dt
-    if (sp.timer <= 0) {
-      const e = spawnEnemy(sp.spec)
-      // An der Markierung erscheinen, nicht an der rohen Leveldefinition - und
-      // nochmal pruefen, falls sich seit der Vorwarnung etwas geaendert hat.
-      e.x = sp.x
-      e.y = sp.y
-      nudgeOutOfBlocks(game.blocks, e, e.radius)
-      game.enemies.push(e)
-      game.pendingSpawns.splice(i, 1)
-    }
-  }
-
-  if (game.wavesDone) return
-  if (game.enemies.length > 0 || game.pendingSpawns.length > 0) return
-
-  if (game.waveIndex >= game.waves.length - 1) {
-    game.wavesDone = true
-    return
-  }
-
-  game.waveGap -= dt
-  if (game.waveGap <= 0) {
-    game.waveGap = TUNING.wave.pauseBetweenWaves
-    startWave(game, game.waveIndex + 1)
-  }
-}
-
-function updateEnemies(game, dt) {
-  const p = game.player
-
-  for (const e of game.enemies) {
-    if (!e.alive) continue
-    if (e.hitFlash > 0) e.hitFlash -= dt
-
-    // Gepanzerte drehen sich langsam - deshalb kann man sie ueberhaupt flankieren.
-    const turn = (e.armored ? 1.3 : e.turnRate) * dt
-    e.angle = angleTowards(e.angle, Math.atan2(p.y - e.y, p.x - e.x), turn)
-
-    if (e.kind === 'hunter') steerHunter(e, game, dt)
-    else if (e.kind === 'charger') steerCharger(e, game, dt)
-    else if (e.kind === 'orbiter') steerOrbiter(e, game, dt)
-
-    e.x = Math.max(e.radius, Math.min(game.width - e.radius, e.x))
-    e.y = Math.max(e.radius, Math.min(game.height - e.radius, e.y))
-
-    // Beweglichen Gegnern stehen Bloecke im Weg wie dem Spieler.
-    if (!e.solid) {
-      for (const b of game.blocks) if (b.alive) pushOut(e, e.radius, b)
-    }
-
-    // Beruehrungsschaden: bewegliche Gegner tun weh, feste schieben nur weg.
-    if (e.contactDamage && circleCircle(e.x, e.y, e.radius, p.x, p.y, p.radius)) {
-      damagePlayer(game, e.x, e.y)
-      if (e.kind === 'charger' && e.chargeState === 'charging') {
-        e.chargeState = 'recover'
-        e.chargeTimer = 1.6
-      }
-    }
-
-    updateBeam(game, e, dt)
-
-    // Nachschuesse einer Salve
-    if (e.burstLeft > 0) {
-      e.burstTimer -= dt
-      if (e.burstTimer <= 0) {
-        e.burstTimer = e.pattern.gap
-        e.burstLeft -= 1
-        pushBullet(
-          game,
-          e.x + Math.cos(e.angle) * e.radius,
-          e.y + Math.sin(e.angle) * e.radius,
-          e.angle,
-          e.pattern.speed,
-          e.pattern.kind,
-        )
-      }
-    }
-
-    if (e.patternName === 'none' || !Number.isFinite(e.pattern.interval)) continue
-    e.cooldown -= dt
-    if (e.cooldown <= 0 && e.burstLeft === 0) {
-      e.cooldown = e.pattern.interval
-      fire(game, e, e.angle)
-    }
-  }
-
-  separate(game)
-  game.enemies = game.enemies.filter((e) => e.alive)
-}
-
-function updateBeam(game, e, dt) {
-  if (e.patternName !== 'beam') return
-
-  if (e.beamWarn > 0) {
-    e.beamWarn -= dt
-    if (e.beamWarn <= 0) {
-      e.beamActive = TUNING.beam.activeSeconds
-      e.beamLength = rayLength(game, e.x, e.y, e.beamAngle, Math.hypot(game.width, game.height))
-    }
-    return
-  }
-
-  if (e.beamActive > 0) {
-    e.beamActive -= dt
-    const p = game.player
-    const ex = e.x + Math.cos(e.beamAngle) * e.beamLength
-    const ey = e.y + Math.sin(e.beamAngle) * e.beamLength
-    const d = distToSegment(p.x, p.y, e.x, e.y, ex, ey)
-    if (d < (TUNING.beam.width / 2) * game.scale + p.radius) {
-      damagePlayer(game, e.x, e.y)
-    }
-  }
-}
-
-function updateCores(game, dt) {
-  const shielded = isShielded(game)
-  const mayFire = game.coreFiresDuringWaves || !shielded
-  const cfg = TUNING.core
-
-  for (const c of game.cores) {
-    if (!c.alive) continue
-    if (c.hitFlash > 0) c.hitFlash -= dt
-    c.spin += cfg.spinRate * dt
-    if (c.pattern === 'none' || !mayFire) continue
-
-    c.cooldown -= dt
-    if (c.cooldown <= 0) {
-      c.cooldown = cfg.fireInterval
-      for (let k = 0; k < cfg.arms; k++) {
-        const a = c.spin + (k * Math.PI * 2) / cfg.arms
-        pushBullet(game, c.x + Math.cos(a) * c.radius, c.y + Math.sin(a) * c.radius, a, cfg.bulletSpeed, 'purple')
-      }
-    }
-  }
-}
-
-function updatePlayerBullets(game, dt) {
-  for (let i = game.bullets.length - 1; i >= 0; i--) {
-    const b = game.bullets[i]
-    b.x += b.vx * dt
-    b.y += b.vy * dt
-
-    if (b.x < -20 || b.x > game.width + 20 || b.y < -20 || b.y > game.height + 20) {
-      game.bullets.splice(i, 1)
-      continue
-    }
-
-    let consumed = false
-
-    // Orange Gegnerkugeln lassen sich abschiessen, violette nicht.
-    for (let j = game.enemyBullets.length - 1; j >= 0; j--) {
-      const eb = game.enemyBullets[j]
-      if (eb.kind !== 'orange') continue
-      if (circleCircle(b.x, b.y, b.radius, eb.x, eb.y, eb.radius)) {
-        game.enemyBullets.splice(j, 1)
-        burst(game, eb.x, eb.y, PALETTE.bulletOrange, 4)
-        consumed = true
-        break
-      }
-    }
-    if (consumed) {
-      game.bullets.splice(i, 1)
-      continue
-    }
-
-    for (const block of game.blocks) {
-      if (!block.alive || !circleRect(b.x, b.y, b.radius, block)) continue
-      if (block.type === 'destructible') {
-        block.hp -= 1
-        if (block.hp <= 0) {
-          block.alive = false
-          burst(game, block.x + block.w / 2, block.y + block.h / 2, PALETTE.boneDim, 10)
-        }
-      }
-      consumed = true
-      break
-    }
-    if (consumed) {
-      game.bullets.splice(i, 1)
-      continue
-    }
-
-    for (const e of game.enemies) {
-      if (!e.alive || !circleCircle(b.x, b.y, b.radius, e.x, e.y, e.radius)) continue
-
-      // Gepanzerte sind nur von hinten verwundbar. Sie drehen sich langsam,
-      // also ist Flankieren moeglich.
-      let hurts = true
-      if (e.armored) {
-        const impact = Math.atan2(b.y - e.y, b.x - e.x)
-        hurts = Math.abs(normalizeAngle(impact - e.angle)) > Math.PI / 2
-      }
-
-      if (hurts) {
-        e.hp -= 1
-        e.hitFlash = 0.12
-        if (e.hp <= 0) {
-          e.alive = false
-          burst(game, e.x, e.y, e.kind === 'charger' ? PALETTE.charger : PALETTE.bone, 14)
-        }
-      } else {
-        burst(game, b.x, b.y, PALETTE.boneMute, 3)
-      }
-      consumed = true
-      break
-    }
-    if (consumed) {
-      game.bullets.splice(i, 1)
-      continue
-    }
-
-    for (const c of game.cores) {
-      if (!c.alive || !circleCircle(b.x, b.y, b.radius, c.x, c.y, c.radius)) continue
-      // Solange Wellen laufen, ist der Kern abgeschirmt.
-      if (!isShielded(game)) {
-        c.hp -= 1
-        c.hitFlash = 0.1
-        game.shake = Math.max(game.shake, 0.1)
-        if (c.hp <= 0) {
-          c.alive = false
-          burst(game, c.x, c.y, PALETTE.sigText, 22)
-          game.shake = 0.45
-        }
-      }
-      consumed = true
-      break
-    }
-    if (consumed) game.bullets.splice(i, 1)
-  }
-}
-
-function updateEnemyBullets(game, dt) {
-  const p = game.player
-  for (let i = game.enemyBullets.length - 1; i >= 0; i--) {
-    const b = game.enemyBullets[i]
-
-    if (b.homing) {
-      b.life -= dt
-      if (b.life <= 0) {
-        b.homing = false
-      } else {
-        const speed = Math.hypot(b.vx, b.vy)
-        const want = Math.atan2(p.y - b.y, p.x - b.x)
-        const now = Math.atan2(b.vy, b.vx)
-        const next = angleTowards(now, want, TUNING.bullet.homingTurnRate * dt)
-        b.vx = Math.cos(next) * speed
-        b.vy = Math.sin(next) * speed
-      }
-    }
-
-    b.x += b.vx * dt
-    b.y += b.vy * dt
-
-    if (b.x < -30 || b.x > game.width + 30 || b.y < -30 || b.y > game.height + 30) {
-      game.enemyBullets.splice(i, 1)
-      continue
-    }
-
-    let blocked = false
-    for (const block of game.blocks) {
-      if (block.alive && circleRect(b.x, b.y, b.radius, block)) {
-        blocked = true
-        break
-      }
-    }
-    if (blocked) {
-      game.enemyBullets.splice(i, 1)
-      continue
-    }
-
-    if (circleCircle(b.x, b.y, b.radius, p.x, p.y, p.radius)) {
-      game.enemyBullets.splice(i, 1)
-      damagePlayer(game, b.x, b.y)
-    }
-  }
-}
-
-function updateSparks(game, dt) {
-  for (let i = game.sparks.length - 1; i >= 0; i--) {
-    const s = game.sparks[i]
-    s.life -= dt
-    if (s.life <= 0) {
-      game.sparks.splice(i, 1)
-      continue
-    }
-    s.x += s.vx * dt
-    s.y += s.vy * dt
-    s.vx *= 0.92
-    s.vy *= 0.92
-  }
+export function debugSkipToBoss(game) {
+  debugClearWave(game)
+  if (game.phase === 'intro') setPhase(game, 'waves')
+  game.waveIndex = game.waveCount - 1
+  game.clearedWave = game.waveIndex
+  game.waveDelay = 0
 }

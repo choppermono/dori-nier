@@ -15,4 +15,8 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  build: {
+    // three.js is one large chunk, loaded after first paint. Expected, not a problem.
+    chunkSizeWarningLimit: 800,
+  },
 })

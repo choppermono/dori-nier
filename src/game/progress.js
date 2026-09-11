@@ -1,13 +1,13 @@
 import { LEVEL_COUNT } from './levels.js'
 
-// Fortschritt liegt nur im Browser des jeweiligen Geraets. Auf dem Handy erreichte
-// Level erscheinen nicht auf dem PC, und geleerte Browserdaten loeschen sie. Fuer ein
-// Spiel ohne Konto ist das in Ordnung - aber es ist eine bewusste Entscheidung.
+// Progress lives only in this browser. Reached sectors on the phone don't
+// show up on the PC, and clearing site data wipes them. For a game without
+// accounts that is fine - but it is a deliberate choice.
 //
-// Jeder Zugriff ist eingepackt: im privaten Modus und bei blockierten Website-Daten
-// wirft localStorage, statt nur leer zu sein.
+// Every access is wrapped: in private mode or with site data blocked,
+// localStorage throws instead of just being empty.
 
-const KEY = 'dori.progress.v1'
+const KEY = 'dori.progress.v2'
 
 function read() {
   try {
@@ -25,35 +25,35 @@ function write(data) {
   try {
     localStorage.setItem(KEY, JSON.stringify(data))
   } catch {
-    // Kein Speicher verfuegbar: das Spiel laeuft weiter, nur ohne Gedaechtnis.
+    // No storage: the game carries on, it just forgets.
   }
 }
 
 export function loadProgress() {
   const data = read()
-  const highest = data ? Math.max(0, Math.min(data.highest, LEVEL_COUNT - 1)) : 0
-  return { highest, cleared: Array.isArray(data?.cleared) ? data.cleared : [] }
-}
-
-// Das hoechste je erreichte Level bleibt gespeichert. Eine Niederlage wirft im
-// laufenden Durchgang ein Level zurueck, nicht im Fortschritt.
-export function rememberReached(levelIndex) {
-  const p = loadProgress()
-  if (levelIndex > p.highest) {
-    write({ highest: levelIndex, cleared: p.cleared })
+  return {
+    highest: data ? Math.max(0, Math.min(data.highest, LEVEL_COUNT - 1)) : 0,
+    cleared: Array.isArray(data?.cleared) ? data.cleared.filter((i) => i >= 0 && i < LEVEL_COUNT) : [],
+    best: data && typeof data.best === 'object' && data.best ? data.best : {},
   }
 }
 
-export function rememberCleared(levelIndex) {
+// Returns true when this was a new best time for the sector.
+export function rememberCleared(index, time) {
   const p = loadProgress()
-  const cleared = p.cleared.includes(levelIndex) ? p.cleared : [...p.cleared, levelIndex]
-  write({ highest: Math.max(p.highest, Math.min(levelIndex + 1, LEVEL_COUNT - 1)), cleared })
+  const cleared = p.cleared.includes(index) ? p.cleared : [...p.cleared, index]
+  const best = { ...p.best }
+  const prev = best[index]
+  const record = typeof prev !== 'number' || time < prev
+  if (record) best[index] = Math.round(time * 10) / 10
+  write({ highest: Math.max(p.highest, Math.min(index + 1, LEVEL_COUNT - 1)), cleared, best })
+  return record
 }
 
 export function resetProgress() {
   try {
     localStorage.removeItem(KEY)
   } catch {
-    // egal
+    // fine
   }
 }

@@ -1,39 +1,45 @@
 /* ==========================================================================
-   Dori — globale Tokens und Reset
-   Palette und Schriften uebernommen aus PersonalSite/src/style.css, damit
-   Startseite und Spiel wie dasselbe Produkt aussehen.
+   Dori - global tokens and reset
+   Palette and type are taken from PersonalSite/src/style.css, so halldor.ch
+   and the game read as one product. Each sector adds its own --accent.
    ========================================================================== */
 
 :root {
-  /* --- Flaechen: warmes Anthrazit, nie reines Schwarz --- */
+  /* --- Surfaces: warm charcoal, never pure black --- */
   --void: #100f0d;
   --ash: #16150f;
   --panel: #1c1b14;
   --panel-solid: #221f18;
 
-  /* --- Tinte: das NieR-Pergament --- */
-  --bone: #dcd8c0; /* 13.3:1 auf --void */
+  /* --- Ink: the NieR parchment --- */
+  --bone: #dcd8c0; /* 13.3:1 on --void */
   --bone-dim: #a9a48a; /*  7.6:1 */
-  --bone-mute: #8f8a73; /*  5.5:1 — dunkelster Ton, der noch Text tragen darf */
+  --bone-mute: #8f8a73; /*  5.5:1 - the dimmest tone still allowed to carry text */
 
-  /* --- Linien --- */
+  /* --- Lines --- */
   --line: rgba(220, 216, 192, 0.2);
   --line-strong: rgba(220, 216, 192, 0.42);
 
-  /* --- Signalrot --- */
+  /* --- Signal red: -text is the readable one, -fill is decorative --- */
   --sig-text: #e0574f;
   --sig-fill: #bc3f3c;
 
-  /* --- Bedrohungen bleiben laut. Die ruhige Palette gilt fuer Rahmen und
-         Menue, nicht fuer Dinge, die einen toeten. --- */
-  --bullet-orange: #e8a33d;
-  --bullet-purple: #b47fdd;
-
-  /* --- Schrift --- */
+  /* --- Type --- */
   --display: 'Cormorant Garamond', 'Iowan Old Style', Georgia, serif;
   --body: 'Barlow', system-ui, 'Segoe UI', sans-serif;
   --mono: 'JetBrains Mono', ui-monospace, Consolas, monospace;
 
+  /* --- Space --- */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 16px;
+  --s-4: 24px;
+  --s-5: 40px;
+
+  /* --- Motion --- */
+  --fast: 140ms;
+  --base: 260ms;
+  --slow: 620ms;
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
 
   color-scheme: dark;
@@ -58,7 +64,8 @@ body {
   color: var(--bone);
   font-family: var(--body);
   -webkit-font-smoothing: antialiased;
-  /* Ueberscrollen auf dem Handy abschalten, sonst zieht der Daumen die Seite mit. */
+  -moz-osx-font-smoothing: grayscale;
+  /* No overscroll on phones, or a thumb drags the whole page along. */
   overscroll-behavior: none;
 }
 
@@ -68,4 +75,58 @@ body {
 
 button {
   font-family: var(--body);
+}
+
+/* One focus style everywhere. Never removed, only restyled. */
+:focus-visible {
+  outline: 2px solid var(--bone);
+  outline-offset: 3px;
+}
+
+::selection {
+  background: var(--bone);
+  color: var(--void);
+}
+
+/* Small tracked system labels - the HUD voice. */
+.label {
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  font-weight: 400;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--bone-dim);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  font-family: var(--mono);
+  font-size: 0.625rem;
+  line-height: 1.4;
+  color: var(--bone);
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }
