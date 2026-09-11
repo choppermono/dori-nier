@@ -555,10 +555,13 @@ footer {
   margin: 0;
   font-family: var(--display);
   font-weight: 300;
-  font-size: clamp(2.2rem, 5vw, 3.4rem);
-  letter-spacing: 0.2em;
+  /* The long names (CONTAGION, OVERDRIVE) must stay inside the card. */
+  font-size: clamp(1.7rem, 3.4vw, 2.6rem);
+  letter-spacing: 0.12em;
+  margin-right: -0.12em;
   text-transform: uppercase;
-  line-height: 1;
+  line-height: 1.05;
+  overflow-wrap: anywhere;
 }
 
 .detail .sub {
@@ -684,7 +687,7 @@ footer {
   }
 
   .detail h2 {
-    font-size: 2rem;
+    font-size: 1.7rem;
   }
 
   .detail .sub,

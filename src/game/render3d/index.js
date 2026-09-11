@@ -254,9 +254,10 @@ export function createRenderer(canvas, options = {}) {
     scene.fog = new FogExp2(theme.fog, theme.fogDensity)
     renderer.setClearColor(theme.fog, 1)
     renderer.toneMappingExposure = theme.exposure
-    bloom.strength = theme.bloom.strength
+    // Half strength and a higher cut-off: things glow, nothing blinds.
+    bloom.strength = theme.bloom.strength * 0.5
     bloom.radius = theme.bloom.radius
-    bloom.threshold = theme.bloom.threshold
+    bloom.threshold = Math.min(0.95, theme.bloom.threshold + 0.08)
     finalPass.uniforms.uScanColor.value.set(theme.floor.line)
     const fx = createFx(scene, M, glowTex, theme)
     world = { themeId: game.theme, W: game.W, D: game.D, theme, M, env, fx }
@@ -419,7 +420,7 @@ export function createRenderer(canvas, options = {}) {
         fx.debris(ev.x, 0.4, ev.y, new Color(world.theme.player.hull), 16, 5)
         fx.ring(ev.x, ev.y, 0.2, 5, 0.9, P.player)
         fx.flash(ev.x, ev.y, P.player, 6, 0.6, 14)
-        post.flash = 0.35
+        post.flash = 0.22
         post.color.set(world.theme.enemy.trim)
         break
       case 'spawn':
@@ -466,7 +467,7 @@ export function createRenderer(canvas, options = {}) {
         fx.sparks(ev.x, 1.4, ev.y, P.accent, 50, 7)
         fx.ring(ev.x, ev.y, 0.5, 7, 0.9, P.accent)
         fx.flash(ev.x, ev.y, P.accent, 6, 0.6, 14)
-        post.flash = 0.22
+        post.flash = 0.14
         post.color.set(world.theme.floor.accent)
         break
       case 'bossSpawn':
@@ -474,7 +475,7 @@ export function createRenderer(canvas, options = {}) {
         fx.ring(ev.x, ev.y, 0.5, 5, 0.8, P.white, 1, 0.08, 0.15)
         fx.sparks(ev.x, 1.2, ev.y, P.trim, 50, 6)
         fx.flash(ev.x, ev.y, P.trim, 7, 0.7, 16)
-        post.flash = 0.3
+        post.flash = 0.18
         post.glitch = 0.8
         post.color.set(world.theme.enemy.trim)
         break
@@ -497,7 +498,7 @@ export function createRenderer(canvas, options = {}) {
         fx.debris(ev.x, 1.2, ev.y, P.trim, 20, 6, 0.12)
         for (let i = 0; i < 3; i++) fx.ring(ev.x, ev.y, 0.5, 6 + i * 4, 1 + i * 0.3, i === 1 ? P.white : P.trim, 1, 0.07, i * 0.18)
         fx.flash(ev.x, ev.y, P.white, 9, 1.2, 22)
-        post.flash = 0.55
+        post.flash = 0.3
         post.color.set('#ffffff')
         break
       case 'dissolve': {

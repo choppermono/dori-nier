@@ -206,15 +206,15 @@ export function createFx(scene, M, glowTex, theme) {
   }
 
   const P = {
-    hot: hdr(SIGNAL.hot, light ? 1.2 : 2.6),
-    trim: hdr(theme.enemy.trim, light ? 1 : 2.2),
-    accent: hdr(theme.floor.accent, light ? 1 : 2.2),
-    player: hdr(theme.player.trim, light ? 0.4 : 2),
-    white: hdr('#ffffff', light ? 0.6 : 2.2),
+    hot: hdr(SIGNAL.hot, light ? 1.2 : 1.9),
+    trim: hdr(theme.enemy.trim, light ? 1 : 1.6),
+    accent: hdr(theme.floor.accent, light ? 1 : 1.6),
+    player: hdr(theme.player.trim, light ? 0.4 : 1.5),
+    white: hdr('#ffffff', light ? 0.6 : 1.5),
     grey: new Color(light ? '#555555' : '#a8a8a8'),
     hull: new Color(theme.enemy.hull),
     block: new Color(theme.block.color),
-    ice: hdr('#bff3ff', light ? 1 : 2),
+    ice: hdr('#bff3ff', light ? 1 : 1.5),
   }
 
   // ---------- bullets ----------
@@ -226,9 +226,9 @@ export function createFx(scene, M, glowTex, theme) {
   const hotGlow = keep(
     new MeshBasicMaterial({
       map: glowTex,
-      color: hdr(SIGNAL.hot, light ? 0.8 : 1.6),
+      color: hdr(SIGNAL.hot, light ? 0.8 : 1.2),
       transparent: true,
-      opacity: light ? 0.5 : 0.9,
+      opacity: light ? 0.5 : 0.7,
       blending: blend,
       depthWrite: false,
       toneMapped: false,
@@ -261,7 +261,7 @@ export function createFx(scene, M, glowTex, theme) {
     glow: instanced(planeGeo, coldGlow, CAP),
   }
   const shotGeo = keep(new BoxGeometry(1, 1, 1))
-  const shotMat = keep(new MeshBasicMaterial({ color: light ? '#2a2a2a' : hdr(theme.player.trim, 3), toneMapped: false }))
+  const shotMat = keep(new MeshBasicMaterial({ color: light ? '#2a2a2a' : hdr(theme.player.trim, 2), toneMapped: false }))
   const shotGlowMat = keep(
     new MeshBasicMaterial({
       map: glowTex,
@@ -534,7 +534,7 @@ export function createFx(scene, M, glowTex, theme) {
     L.l.distance = range
     L.t = 0
     L.dur = dur
-    L.i = intensity * 6
+    L.i = intensity * 3.5
     L.l.visible = true
   }
 
@@ -612,12 +612,16 @@ export function createFx(scene, M, glowTex, theme) {
       }),
     )
   const stripGeo = keep(new PlaneGeometry(1, 1).rotateX(-Math.PI / 2).translate(0.5, 0, 0))
-  const beamCoreMat = keep(new MeshBasicMaterial({ color: hdr('#ffffff', light ? 1 : 2.6), toneMapped: false }))
+  // Tinted rather than pure white: a full-arena beam used to white out a
+  // quarter of the screen.
+  const beamCoreMat = keep(
+    new MeshBasicMaterial({ color: new Color('#ffffff').lerp(new Color(theme.enemy.trim), 0.35).multiplyScalar(light ? 1 : 1.2), toneMapped: false }),
+  )
   const beamGlowMat = keep(
     new MeshBasicMaterial({
       color: P.trim,
       transparent: true,
-      opacity: light ? 0.7 : 0.55,
+      opacity: light ? 0.6 : 0.32,
       blending: blend,
       depthWrite: false,
       side: DoubleSide,
@@ -708,10 +712,13 @@ export function createFx(scene, M, glowTex, theme) {
         B.warn.visible = false
         B.core.visible = true
         B.glow.visible = true
-        const w = h.width * (0.35 + 0.25 * Math.sin(t * 60))
+        // Thinner core, and thinner still for the lines that cross the whole
+        // arena - three of those at once used to be blinding.
+        const thin = h.line ? 0.6 : 1
+        const w = h.width * thin * (0.22 + 0.12 * Math.sin(t * 60))
         B.core.scale.set(len, w, w)
-        B.glow.scale.set(len, 1, h.width * 2.6)
-        B.glow.material.opacity = (light ? 0.7 : 0.55) * Math.min(1, k * 3)
+        B.glow.scale.set(len, 1, h.width * thin * 1.9)
+        B.glow.material.opacity = (light ? 0.6 : 0.32) * Math.min(1, k * 3)
       }
     }
     for (; i < beams.length; i++) {

@@ -80,8 +80,8 @@ export function themeMaterials(theme, glowTex) {
       roughness: 0.35,
       flatShading: true,
     }),
-    enemyGlow: new MeshBasicMaterial({ color: hdr(theme.enemy.trim, 2.6), toneMapped: false }),
-    enemyEdge: new LineBasicMaterial({ color: hdr(theme.enemy.trim, 1.5), toneMapped: false, transparent: true, opacity: 0.9 }),
+    enemyGlow: new MeshBasicMaterial({ color: hdr(theme.enemy.trim, 1.7), toneMapped: false }),
+    enemyEdge: new LineBasicMaterial({ color: hdr(theme.enemy.trim, 1.15), toneMapped: false, transparent: true, opacity: 0.9 }),
     enemyGhost: new MeshStandardMaterial({
       color: hullColor,
       emissive: theme.enemy.trim,
@@ -99,7 +99,7 @@ export function themeMaterials(theme, glowTex) {
       toneMapped: false,
       depthWrite: false,
     }),
-    flash: new MeshBasicMaterial({ color: hdr('#ffffff', 2.4), toneMapped: false }),
+    flash: new MeshBasicMaterial({ color: hdr('#ffffff', 1.6), toneMapped: false }),
 
     playerHull: new MeshStandardMaterial({
       color: theme.player.hull,
@@ -109,11 +109,11 @@ export function themeMaterials(theme, glowTex) {
       emissive: theme.player.hull,
       emissiveIntensity: light ? 0 : 0.14,
     }),
-    playerTrim: new MeshBasicMaterial({ color: hdr(theme.player.trim, light ? 1 : 2.4), toneMapped: false }),
+    playerTrim: new MeshBasicMaterial({ color: hdr(theme.player.trim, light ? 1 : 1.7), toneMapped: false }),
     playerEdge: new LineBasicMaterial({ color: light ? '#9a978f' : '#101010', transparent: true, opacity: 0.85 }),
 
-    accentGlow: new MeshBasicMaterial({ color: hdr(theme.floor.accent, 2.2), toneMapped: false }),
-    accentEdge: new LineBasicMaterial({ color: hdr(theme.floor.accent, 1.6), toneMapped: false, transparent: true, opacity: 0.9 }),
+    accentGlow: new MeshBasicMaterial({ color: hdr(theme.floor.accent, 1.6), toneMapped: false }),
+    accentEdge: new LineBasicMaterial({ color: hdr(theme.floor.accent, 1.25), toneMapped: false, transparent: true, opacity: 0.9 }),
 
     glowEnemy: new MeshBasicMaterial({
       map: glowTex,
@@ -156,8 +156,8 @@ export function themeMaterials(theme, glowTex) {
       flatShading: true,
     }),
     blockEdge: new LineBasicMaterial({ color: theme.block.edge, transparent: true, opacity: 0.85 }),
-    blockEdgeGlow: new LineBasicMaterial({ color: hdr(theme.block.edge, 1.8), toneMapped: false, transparent: true, opacity: 0.95 }),
-    blockGlow: new MeshBasicMaterial({ color: hdr(theme.block.edge, 2.2), toneMapped: false }),
+    blockEdgeGlow: new LineBasicMaterial({ color: hdr(theme.block.edge, 1.35), toneMapped: false, transparent: true, opacity: 0.95 }),
+    blockGlow: new MeshBasicMaterial({ color: hdr(theme.block.edge, 1.6), toneMapped: false }),
     crateFill: new MeshStandardMaterial({
       color: theme.floor.accent,
       emissive: theme.floor.accent,
@@ -176,7 +176,7 @@ export function themeMaterials(theme, glowTex) {
     }),
 
     wall: new MeshStandardMaterial({ color: theme.wall.color, roughness: 0.55, metalness: 0.2, flatShading: true }),
-    wallTrim: new MeshBasicMaterial({ color: hdr(theme.wall.trim, light ? 0.8 : 2.2), toneMapped: false }),
+    wallTrim: new MeshBasicMaterial({ color: hdr(theme.wall.trim, light ? 0.8 : 1.5), toneMapped: false }),
 
     // The reach of a Warden's shield, drawn on the floor.
     fieldRing: new MeshBasicMaterial({
